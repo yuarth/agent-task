@@ -4,6 +4,7 @@ mod db;
 mod models;
 mod output;
 mod sanitize;
+mod validate;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -33,10 +34,26 @@ fn run_add(conn: &Connection, args: AddArgs) -> Result<()> {
     let ts = now();
 
     let title = sanitize::clean_line(&args.title);
+    validate::require_non_empty_title(&title)?;
+    validate::check_max_len(&title, "title", validate::MAX_TITLE_CHARS)?;
+
     let description = args.description.as_deref().map(sanitize::clean_multiline);
+    if let Some(d) = &description {
+        validate::check_max_len(d, "description", validate::MAX_DESCRIPTION_CHARS)?;
+    }
     let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+    if let Some(a) = &assigned {
+        validate::check_max_len(a, "assigned", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
     let tags = args.tags.as_deref().map(sanitize::clean_line);
+    if let Some(t) = &tags {
+        validate::check_max_len(t, "tags", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
     let due = args.due.as_deref().map(sanitize::clean_line);
+    if let Some(d) = &due {
+        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
+        validate::validate_due_date(d)?;
+    }
 
     let task = db::add_task(
         conn,
@@ -107,10 +124,27 @@ fn run_update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     let ts = now();
 
     let title = args.title.as_deref().map(sanitize::clean_line);
+    if let Some(t) = &title {
+        validate::require_non_empty_title(t)?;
+        validate::check_max_len(t, "title", validate::MAX_TITLE_CHARS)?;
+    }
     let description = args.description.as_deref().map(sanitize::clean_multiline);
+    if let Some(d) = &description {
+        validate::check_max_len(d, "description", validate::MAX_DESCRIPTION_CHARS)?;
+    }
     let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+    if let Some(a) = &assigned {
+        validate::check_max_len(a, "assigned", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
     let tags = args.tags.as_deref().map(sanitize::clean_line);
+    if let Some(t) = &tags {
+        validate::check_max_len(t, "tags", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
     let due = args.due.as_deref().map(sanitize::clean_line);
+    if let Some(d) = &due {
+        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
+        validate::validate_due_date(d)?;
+    }
 
     let updated = db::update_task(
         conn,
