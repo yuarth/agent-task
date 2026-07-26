@@ -33,25 +33,37 @@ fn run_add(conn: &Connection, args: AddArgs) -> Result<()> {
     let priority = Priority::parse(&args.priority)?;
     let ts = now();
 
+    // Length is checked on the *raw* argument, before sanitize::clean_line
+    // touches it: clean_line only ever removes characters, so a raw value
+    // within the limit is guaranteed to stay within it after sanitizing.
+    // Checking after sanitizing instead would mean a pathologically large
+    // argument gets fully scanned (and, if it's built to abuse an
+    // unterminated escape sequence, that scan's cost) before ever being
+    // rejected for its length — defeating the point of having a limit.
+    validate::check_max_len(&args.title, "title", validate::MAX_TITLE_CHARS)?;
     let title = sanitize::clean_line(&args.title);
     validate::require_non_empty_title(&title)?;
-    validate::check_max_len(&title, "title", validate::MAX_TITLE_CHARS)?;
 
-    let description = args.description.as_deref().map(sanitize::clean_multiline);
-    if let Some(d) = &description {
+    if let Some(d) = &args.description {
         validate::check_max_len(d, "description", validate::MAX_DESCRIPTION_CHARS)?;
     }
-    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
-    if let Some(a) = &assigned {
+    let description = args.description.as_deref().map(sanitize::clean_multiline);
+
+    if let Some(a) = &args.assigned {
         validate::check_max_len(a, "assigned", validate::MAX_SHORT_FIELD_CHARS)?;
     }
-    let tags = args.tags.as_deref().map(sanitize::clean_line);
-    if let Some(t) = &tags {
+    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+
+    if let Some(t) = &args.tags {
         validate::check_max_len(t, "tags", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
+    let tags = args.tags.as_deref().map(sanitize::clean_line);
+
+    if let Some(d) = &args.due {
+        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
     }
     let due = args.due.as_deref().map(sanitize::clean_line);
     if let Some(d) = &due {
-        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
         validate::validate_due_date(d)?;
     }
 
@@ -123,26 +135,36 @@ fn run_update(conn: &Connection, args: UpdateArgs) -> Result<()> {
 
     let ts = now();
 
+    // See the matching comment in run_add: length is validated on the raw
+    // argument, before sanitize::clean_line/clean_multiline runs on it.
+    if let Some(t) = &args.title {
+        validate::check_max_len(t, "title", validate::MAX_TITLE_CHARS)?;
+    }
     let title = args.title.as_deref().map(sanitize::clean_line);
     if let Some(t) = &title {
         validate::require_non_empty_title(t)?;
-        validate::check_max_len(t, "title", validate::MAX_TITLE_CHARS)?;
     }
-    let description = args.description.as_deref().map(sanitize::clean_multiline);
-    if let Some(d) = &description {
+
+    if let Some(d) = &args.description {
         validate::check_max_len(d, "description", validate::MAX_DESCRIPTION_CHARS)?;
     }
-    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
-    if let Some(a) = &assigned {
+    let description = args.description.as_deref().map(sanitize::clean_multiline);
+
+    if let Some(a) = &args.assigned {
         validate::check_max_len(a, "assigned", validate::MAX_SHORT_FIELD_CHARS)?;
     }
-    let tags = args.tags.as_deref().map(sanitize::clean_line);
-    if let Some(t) = &tags {
+    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+
+    if let Some(t) = &args.tags {
         validate::check_max_len(t, "tags", validate::MAX_SHORT_FIELD_CHARS)?;
+    }
+    let tags = args.tags.as_deref().map(sanitize::clean_line);
+
+    if let Some(d) = &args.due {
+        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
     }
     let due = args.due.as_deref().map(sanitize::clean_line);
     if let Some(d) = &due {
-        validate::check_max_len(d, "due", validate::MAX_SHORT_FIELD_CHARS)?;
         validate::validate_due_date(d)?;
     }
 
