@@ -10,45 +10,75 @@
 //! - OSC: `ESC ']' ... (BEL | ESC '\\')`
 //! - other two-byte escapes: `ESC <any char>`
 
-fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+/// Max characters scanned after `ESC '['` while looking for a CSI final byte
+/// (0x40..=0x7E). Real CSI sequences are always short (a handful of
+/// parameter/intermediate bytes); without a cap, a malformed/malicious
+/// `ESC '[' <many non-final bytes>` payload with no final byte would let the
+/// scan run to the end of the input, silently swallowing everything after
+/// it. If no final byte turns up within the cap, the sequence is not
+/// treated as CSI: only the ESC itself is dropped, and scanning resumes
+/// from the very next character (the `[` and whatever follows it are
+/// treated as ordinary text, same as any other input).
+const CSI_PARAM_LIMIT: usize = 16;
 
-    while let Some(c) = chars.next() {
+fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < n {
+        let c = chars[i];
+
         if c == '\u{1b}' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    for nc in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&nc) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    while let Some(nc) = chars.next() {
-                        if nc == '\u{7}' {
-                            break;
-                        }
-                        if nc == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
+            if chars.get(i + 1) == Some(&'[') {
+                let params_start = i + 2;
+                let scan_end = (params_start + CSI_PARAM_LIMIT).min(n);
+                let final_byte =
+                    (params_start..scan_end).find(|&j| ('\x40'..='\x7e').contains(&chars[j]));
+
+                i = match final_byte {
+                    // Whole ESC '[' params... final-byte sequence: drop it.
+                    Some(j) => j + 1,
+                    // No final byte within the cap: drop only the ESC.
+                    None => i + 1,
+                };
+                continue;
             }
+
+            if chars.get(i + 1) == Some(&']') {
+                // OSC: ESC ']' ... (BEL | ESC '\\')
+                let mut j = i + 2;
+                let mut end = None;
+                while j < n {
+                    if chars[j] == '\u{7}' {
+                        end = Some(j);
+                        break;
+                    }
+                    if chars[j] == '\u{1b}' && chars.get(j + 1) == Some(&'\\') {
+                        end = Some(j + 1);
+                        break;
+                    }
+                    j += 1;
+                }
+                i = match end {
+                    Some(e) => e + 1,
+                    None => i + 1,
+                };
+                continue;
+            }
+
+            // Generic two-byte escape (ESC + one char), or a lone trailing ESC.
+            i += if i + 1 < n { 2 } else { 1 };
             continue;
         }
 
         if c.is_control() && !keep_control(c) {
+            i += 1;
             continue;
         }
         out.push(c);
+        i += 1;
     }
 
     out
@@ -106,5 +136,38 @@ mod tests {
     fn clean_multiline_keeps_newlines_and_tabs_but_strips_escape() {
         let input = "line1\n\x1b[2Jline2\tend";
         assert_eq!(clean_multiline(input), "line1\nline2\tend");
+    }
+
+    #[test]
+    fn clean_line_recognizes_csi_sequence_right_at_param_limit() {
+        // 15 parameter bytes + 1 final byte = 16 bytes scanned: within the cap.
+        let params = "1".repeat(15);
+        let input = format!("\x1b[{params}mEND");
+        assert_eq!(clean_line(&input), "END");
+    }
+
+    #[test]
+    fn clean_line_gives_up_on_csi_over_param_limit_and_keeps_scanning() {
+        // 16 parameter bytes + 1 final byte = 17 bytes scanned: exceeds the
+        // cap, so this must NOT be treated as a CSI sequence. Only the ESC
+        // is dropped; the '[' and everything after it survive as literal
+        // text (including the stray "final" byte, which is no longer
+        // interpreted as one since no CSI was recognized).
+        let params = "1".repeat(16);
+        let input = format!("\x1b[{params}mEND");
+        let expected = format!("[{params}mEND");
+        assert_eq!(clean_line(&input), expected);
+    }
+
+    #[test]
+    fn clean_line_unterminated_csi_does_not_swallow_trailing_text() {
+        // No final byte anywhere: without a cap this would consume the rest
+        // of the string. It must stop at the limit and preserve "TAIL".
+        let junk = "9".repeat(50);
+        let input = format!("\x1b[{junk}TAIL");
+        assert!(
+            clean_line(&input).ends_with("TAIL"),
+            "trailing text must survive an unterminated CSI payload"
+        );
     }
 }

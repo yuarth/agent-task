@@ -292,6 +292,23 @@ fn ansi_escape_in_assigned_and_tags_is_sanitized() {
 }
 
 #[test]
+fn overlong_unterminated_csi_payload_does_not_swallow_trailing_title_text() {
+    let (_dir, db) = new_db();
+    let junk_params: String = "9".repeat(50);
+    let malicious_title = format!("\x1b[{junk_params}TAIL");
+    cmd(&db).args(["add", &malicious_title]).assert().success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored = value["title"].as_str().unwrap();
+    assert!(
+        stored.ends_with("TAIL"),
+        "後続文字列が欠落してはならない: {stored}"
+    );
+    assert!(!stored.contains('\u{1b}'));
+}
+
+#[test]
 fn tag_filter_percent_wildcard_is_escaped_in_cli() {
     let (_dir, db) = new_db();
     cmd(&db)

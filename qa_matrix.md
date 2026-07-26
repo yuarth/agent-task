@@ -18,13 +18,14 @@
 | データフォーマット | `--json` 出力 | 正当な JSON 配列/オブジェクト構造が出力されパース可能であること | ✅ PASS | `tests/cli.rs::show_returns_valid_json_with_expected_fields`, `list_json_returns_valid_array` — `serde_json::from_str` でパース可能なことおよび主要フィールドの値を検証 |
 | セキュリティ (レビュー指摘 #1) | ANSI エスケープ/制御文字のサニタイズ | `title`/`description`/`assigned_agent`/`tags`/`due_date` に含まれる ESC (0x1B) 起点の CSI/OSC シーケンスおよびその他の制御文字が、格納時に無害化されること | ✅ PASS | `src/sanitize.rs::tests` (CSI カラー/カーソル移動/画面クリア/OSC ハイパーリンク偽装/C1 制御文字を網羅)、`tests/cli.rs::ansi_escape_sequences_are_sanitized_on_add`, `ansi_escape_sequences_are_sanitized_on_update`, `ansi_escape_in_assigned_and_tags_is_sanitized` — `add`/`update` 経由で悪意あるエスケープシーケンスを注入し、`show --json` で取得した値にシーケンスが残存しないことを確認 |
 | セキュリティ (レビュー指摘 #2) | `tag` フィルタの LIKE ワイルドカードエスケープ | タグ値に含まれる `%` / `_` が LIKE パターンのワイルドカードとして解釈されず、リテラル一致すること | ✅ PASS | `src/db.rs::tests::tag_filter_escapes_percent_wildcard`, `tag_filter_escapes_underscore_wildcard`、`tests/cli.rs::tag_filter_percent_wildcard_is_escaped_in_cli`, `tag_filter_underscore_wildcard_is_escaped_in_cli` — エスケープなしなら誤ヒットする組（`100%`/`100X`, `a_b`/`axb`）で意図した1件のみに絞り込まれることを確認。`assigned` フィルタは元々 `=` による厳密一致（バインドパラメータ経由）で `LIKE` を使用していないため、ワイルドカード解釈のリスクはなく変更不要 |
-| Nix ビルド | `nix-build default.nix` | サンドボックス内でコンパイル・全テストが通過し単一バイナリが生成されること | ✅ PASS | `nix-build default.nix --no-out-link` 成功。ビルド中に `cargo test` (単体20件 + 結合17件 = 37件) が Nix サンドボックス内で実行され全件 PASS。生成バイナリ (`bin/agent-task`) の `--version` / `add` / `list --json` 実行を確認 |
+| セキュリティ (レビュー指摘 #3) | CSI パラメータ長の上限 | `ESC '['` に続く終端バイト無しの長大な入力でも、後続文字列を無限にスキャン/消費しないこと(上限16バイトで打ち切り、超過時は ESC のみ破棄してスキャン継続) | ✅ PASS | `src/sanitize.rs::tests::clean_line_recognizes_csi_sequence_right_at_param_limit`(境界内=16バイトは正規CSIとして除去), `clean_line_gives_up_on_csi_over_param_limit_and_keeps_scanning`(境界超過=17バイトはESCのみ破棄しリテラル保持), `clean_line_unterminated_csi_does_not_swallow_trailing_text`, `tests/cli.rs::overlong_unterminated_csi_payload_does_not_swallow_trailing_title_text` — 終端バイトの無い50バイトのダミーパラメータを付与しても末尾の `TAIL` 文字列が欠落しないことを確認 |
+| Nix ビルド | `nix-build default.nix` | サンドボックス内でコンパイル・全テストが通過し単一バイナリが生成されること | ✅ PASS | `nix-build default.nix --no-out-link` 成功。ビルド中に `cargo test` (単体23件 + 結合18件 = 41件) が Nix サンドボックス内で実行され全件 PASS。生成バイナリ (`bin/agent-task`) の `--version` / `add` / `list --json` 実行を確認 |
 | Nix ビルド | `nix build .#default` | サンドボックス内でコンパイル・全テストが通過し単一バイナリが生成されること | ✅ PASS | `nix build .#default --no-link` 成功 (flake, `nixpkgs/nixos-unstable` 入力)。生成バイナリの `--help` 実行を確認 |
 
 ## 実行コマンド一覧（再現用）
 
 ```bash
-# ユニット + 結合テスト (37件)
+# ユニット + 結合テスト (41件)
 cargo test
 
 # Lint / フォーマット
@@ -54,3 +55,10 @@ nix build .#default
 - `tag` フィルタの LIKE パターンは `ESCAPE '\'` 句を用い、ユーザー入力中の
   `\`/`%`/`_` をエスケープしてからバインドする。`assigned`/`status`/`priority`
   フィルタはもともと `=` による厳密一致（パラメータバインド）のため対象外。
+- CSI スキャン (`ESC '[' params... final-byte`) は `ESC '['` の後、最大
+  `CSI_PARAM_LIMIT = 16` 文字まで終端バイト (`0x40..=0x7E`) を探索する。
+  上限内に見つからない場合はそのシーケンスを CSI とみなさず、ESC のみを
+  破棄して次の文字からスキャンを再開する（`[` や後続文字はそのまま通常の
+  文字として扱われる）。これにより、終端バイトを持たない不正/悪意ある
+  `ESC '['` ペイロードが入力の残り全体を無制限に飲み込んでしまう
+  （後続テキストが丸ごと欠落する）事態を防いでいる。
