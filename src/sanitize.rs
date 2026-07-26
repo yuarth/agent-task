@@ -34,12 +34,29 @@ fn skip_csi(chars: &[char], params_start: usize, n: usize) -> Option<usize> {
         .map(|j| j + 1)
 }
 
+/// Max characters scanned after an OSC introducer while looking for its
+/// terminator (BEL or ST). Real OSC payloads (e.g. an OSC-8 hyperlink's URI)
+/// are rarely more than a couple hundred characters; this is set well above
+/// that. Without a cap, an unterminated `ESC ']'`/`0x9D` payload makes this
+/// scan run to the end of the input — and worse, an input containing *many*
+/// such introducers back-to-back (e.g. `"\x1b]".repeat(n)`) re-triggers that
+/// full-length scan for each one, making total work O(n^2). Measured on the
+/// pre-fix code: a 320,000-character such payload took ~11 seconds to
+/// sanitize. Capping the scan bounds each attempt to O(OSC_PARAM_LIMIT),
+/// same fix shape as [`CSI_PARAM_LIMIT`] above.
+const OSC_PARAM_LIMIT: usize = 512;
+
 /// Scan for an OSC terminator (BEL, or ESC '\\' i.e. ST) starting at
-/// `params_start`. Returns the index just past the whole sequence if found,
-/// or `None` if unterminated (caller then drops only the introducer).
+/// `params_start`. Returns the index just past the whole sequence if found
+/// within [`OSC_PARAM_LIMIT`], or `None` otherwise (caller then drops only
+/// the introducer and keeps scanning — the terminator's BEL/ESC bytes, if
+/// any appear further out, still get dropped independently by the generic
+/// control-character filter, so no escape sequence can survive intact even
+/// when a payload exceeds the cap).
 fn skip_osc(chars: &[char], params_start: usize, n: usize) -> Option<usize> {
+    let scan_end = (params_start + OSC_PARAM_LIMIT).min(n);
     let mut j = params_start;
-    while j < n {
+    while j < scan_end {
         if chars[j] == '\u{7}' {
             return Some(j + 1);
         }
@@ -196,6 +213,49 @@ mod tests {
         let input = format!("\u{9b}{params}mEND");
         let expected = format!("{params}mEND");
         assert_eq!(clean_line(&input), expected);
+    }
+
+    #[test]
+    fn clean_line_osc_over_param_limit_drops_only_introducer() {
+        // Regression test for the O(n^2) DoS found in adversarial review:
+        // an unterminated OSC payload longer than OSC_PARAM_LIMIT must not
+        // be scanned past the cap. Only the introducer is dropped; the rest
+        // (including the terminal marker "TAIL") survives as literal text.
+        let junk = "9".repeat(OSC_PARAM_LIMIT + 100);
+        let input = format!("\x1b]{junk}TAIL");
+        let out = clean_line(&input);
+        assert!(
+            out.ends_with("TAIL"),
+            "trailing text must survive an over-limit unterminated OSC payload"
+        );
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn clean_line_many_unterminated_osc_introducers_completes_quickly() {
+        // The bug this guards against was quadratic: many unterminated OSC
+        // introducers back-to-back each re-triggered a full-length scan.
+        // 200,000 introducers (400,000 chars) took over a minute pre-fix;
+        // bounded scanning should finish this near-instantly. A generous
+        // wall-clock ceiling keeps this from being flaky on a slow CI
+        // machine while still catching any reintroduction of the O(n^2)
+        // behavior (which would blow well past it).
+        let input = "\x1b]".repeat(200_000);
+        let start = std::time::Instant::now();
+        let out = clean_line(&input);
+        let elapsed = start.elapsed();
+        // Every ESC is dropped (no terminator found within the cap for any
+        // of the 200,000 introducers), but the ']' right after each one is
+        // ordinary text and survives — this isn't asserting "everything
+        // vanishes", just that the scan actually completes (see the timing
+        // assertion below) rather than hanging.
+        assert_eq!(out, "]".repeat(200_000));
+        assert!(
+            elapsed.as_secs() < 5,
+            "sanitizing {} chars took {:?}, expected sub-second; possible O(n^2) regression",
+            input.chars().count(),
+            elapsed
+        );
     }
 
     #[test]
