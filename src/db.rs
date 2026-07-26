@@ -76,6 +76,15 @@ pub struct ListFilter {
     pub all: bool,
 }
 
+/// Escape `\`, `%`, and `_` so a value can be interpolated into a SQL
+/// `LIKE ... ESCAPE '\'` pattern and matched literally.
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 const TASK_COLUMNS: &str =
     "id, title, description, status, priority, assigned_agent, tags, created_at, updated_at, due_date";
 
@@ -148,8 +157,10 @@ pub fn list_tasks(conn: &Connection, filter: &ListFilter) -> Result<Vec<Task>> {
     }
 
     if let Some(tag) = &filter.tag {
-        sql.push_str(" AND (',' || REPLACE(tags, ' ', '') || ',') LIKE ?");
-        params.push(Box::new(format!("%,{},%", tag.trim())));
+        // Escape LIKE wildcards (% and _) in user input so a tag like "50%"
+        // or "a_b" is matched literally instead of as a pattern.
+        sql.push_str(" AND (',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'");
+        params.push(Box::new(format!("%,{},%", escape_like(tag.trim()))));
     }
 
     sql.push_str(" ORDER BY \
@@ -491,6 +502,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(done.status, "done");
+    }
+
+    #[test]
+    fn tag_filter_escapes_percent_wildcard() {
+        let conn = mem_conn();
+        add_task(
+            &conn,
+            "A",
+            None,
+            "todo",
+            "medium",
+            None,
+            Some("100%"),
+            None,
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+        add_task(
+            &conn,
+            "B",
+            None,
+            "todo",
+            "medium",
+            None,
+            Some("100X"),
+            None,
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+
+        // Without escaping, "100%" would match "100X" too via the LIKE wildcard.
+        let matches = list_tasks(
+            &conn,
+            &ListFilter {
+                tag: Some("100%".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "A");
+    }
+
+    #[test]
+    fn tag_filter_escapes_underscore_wildcard() {
+        let conn = mem_conn();
+        add_task(
+            &conn,
+            "A",
+            None,
+            "todo",
+            "medium",
+            None,
+            Some("a_b"),
+            None,
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+        add_task(
+            &conn,
+            "B",
+            None,
+            "todo",
+            "medium",
+            None,
+            Some("axb"),
+            None,
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+
+        // Without escaping, "a_b" would match "axb" too since "_" matches any char.
+        let matches = list_tasks(
+            &conn,
+            &ListFilter {
+                tag: Some("a_b".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "A");
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod color;
 mod db;
 mod models;
 mod output;
+mod sanitize;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -31,15 +32,21 @@ fn run_add(conn: &Connection, args: AddArgs) -> Result<()> {
     let priority = Priority::parse(&args.priority)?;
     let ts = now();
 
+    let title = sanitize::clean_line(&args.title);
+    let description = args.description.as_deref().map(sanitize::clean_multiline);
+    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+    let tags = args.tags.as_deref().map(sanitize::clean_line);
+    let due = args.due.as_deref().map(sanitize::clean_line);
+
     let task = db::add_task(
         conn,
-        &args.title,
-        args.description.as_deref(),
+        &title,
+        description.as_deref(),
         status.as_str(),
         priority.as_str(),
-        args.assigned.as_deref(),
-        args.tags.as_deref(),
-        args.due.as_deref(),
+        assigned.as_deref(),
+        tags.as_deref(),
+        due.as_deref(),
         &ts,
     )?;
 
@@ -98,16 +105,23 @@ fn run_update(conn: &Connection, args: UpdateArgs) -> Result<()> {
     }
 
     let ts = now();
+
+    let title = args.title.as_deref().map(sanitize::clean_line);
+    let description = args.description.as_deref().map(sanitize::clean_multiline);
+    let assigned = args.assigned.as_deref().map(sanitize::clean_line);
+    let tags = args.tags.as_deref().map(sanitize::clean_line);
+    let due = args.due.as_deref().map(sanitize::clean_line);
+
     let updated = db::update_task(
         conn,
         args.id,
-        args.title.as_deref(),
-        args.description.as_deref(),
+        title.as_deref(),
+        description.as_deref(),
         args.status.as_deref(),
         args.priority.as_deref(),
-        args.assigned.as_deref(),
-        args.tags.as_deref(),
-        args.due.as_deref(),
+        assigned.as_deref(),
+        tags.as_deref(),
+        due.as_deref(),
         &ts,
     )?
     .ok_or_else(|| anyhow!("タスクが見つかりません (ID: {})", args.id))?;

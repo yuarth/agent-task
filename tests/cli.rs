@@ -238,6 +238,99 @@ fn tag_filter_matches_exact_tag_only() {
         .stdout(predicate::str::contains("B").not());
 }
 
+#[test]
+fn ansi_escape_sequences_are_sanitized_on_add() {
+    let (_dir, db) = new_db();
+    let malicious_title = "\x1b[31mHacked\x1b[0m\x07Title";
+    cmd(&db).args(["add", malicious_title]).assert().success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored_title = value["title"].as_str().unwrap();
+    assert!(!stored_title.contains('\u{1b}'));
+    assert!(!stored_title.contains('\u{7}'));
+    assert_eq!(stored_title, "HackedTitle");
+}
+
+#[test]
+fn ansi_escape_sequences_are_sanitized_on_update() {
+    let (_dir, db) = new_db();
+    cmd(&db).args(["add", "普通のタイトル"]).assert().success();
+
+    let malicious_desc = "line1\x1b[2J\x1b[Hline2";
+    cmd(&db)
+        .args(["update", "1", "--description", malicious_desc])
+        .assert()
+        .success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored_desc = value["description"].as_str().unwrap();
+    assert!(!stored_desc.contains('\u{1b}'));
+    assert_eq!(stored_desc, "line1line2");
+}
+
+#[test]
+fn ansi_escape_in_assigned_and_tags_is_sanitized() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args([
+            "add",
+            "T",
+            "--assigned",
+            "claude\x1b[31m",
+            "--tags",
+            "back\x1b[3mend,bug\x07fix",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["assigned_agent"], "claude");
+    assert_eq!(value["tags"], "backend,bugfix");
+}
+
+#[test]
+fn tag_filter_percent_wildcard_is_escaped_in_cli() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "A", "--tags", "100%"])
+        .assert()
+        .success();
+    cmd(&db)
+        .args(["add", "B", "--tags", "100X"])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["list", "--tag", "100%"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A"))
+        .stdout(predicate::str::contains("B").not());
+}
+
+#[test]
+fn tag_filter_underscore_wildcard_is_escaped_in_cli() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "A", "--tags", "a_b"])
+        .assert()
+        .success();
+    cmd(&db)
+        .args(["add", "B", "--tags", "axb"])
+        .assert()
+        .success();
+
+    cmd(&db)
+        .args(["list", "--tag", "a_b"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A"))
+        .stdout(predicate::str::contains("B").not());
+}
+
 /// Multiple OS processes writing to the same SQLite DB concurrently must not
 /// crash or deadlock: WAL mode + busy_timeout should serialize writers.
 #[test]
