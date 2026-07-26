@@ -44,9 +44,21 @@ pub fn resolve_db_path() -> Result<PathBuf> {
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            // Task titles/descriptions can carry sensitive info, and on a
+            // shared multi-user machine the default directory mode (subject
+            // to umask, typically 0755) would let any local user read the
+            // db/wal/shm files inside by traversing into it. Restrict to
+            // owner-only, but only for a directory *we* create here — an
+            // already-existing directory keeps whatever permissions its
+            // owner chose, since silently tightening it could break setups
+            // that intentionally share it.
+            let parent_is_new = !parent.exists();
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("ディレクトリの作成に失敗しました: {}", parent.display())
             })?;
+            if parent_is_new {
+                harden_dir_permissions(parent)?;
+            }
         }
     }
 
@@ -59,6 +71,20 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
     init_schema(&conn)?;
     Ok(conn)
+}
+
+/// Restrict a freshly-created directory to owner-only access (0700).
+/// No-op on non-Unix targets, where this crate has no equivalent primitive.
+#[cfg(unix)]
+fn harden_dir_permissions(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("ディレクトリの権限設定に失敗しました: {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn harden_dir_permissions(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -190,10 +216,10 @@ pub fn update_task(
     due: Option<&str>,
     now: &str,
 ) -> Result<Option<Task>> {
-    if get_task(conn, id)?.is_none() {
-        return Ok(None);
-    }
-
+    // No separate existence pre-check: UPDATE against a non-existent id
+    // safely affects zero rows (no error), and the final `get_task` below
+    // already reports the correct Some/None either way — a pre-check here
+    // would just be a second, redundant query.
     let mut sets: Vec<String> = vec!["updated_at = ?".to_string()];
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.to_string())];
 
