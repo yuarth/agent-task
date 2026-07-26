@@ -44,21 +44,7 @@ pub fn resolve_db_path() -> Result<PathBuf> {
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            // Task titles/descriptions can carry sensitive info, and on a
-            // shared multi-user machine the default directory mode (subject
-            // to umask, typically 0755) would let any local user read the
-            // db/wal/shm files inside by traversing into it. Restrict to
-            // owner-only, but only for a directory *we* create here — an
-            // already-existing directory keeps whatever permissions its
-            // owner chose, since silently tightening it could break setups
-            // that intentionally share it.
-            let parent_is_new = !parent.exists();
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("ディレクトリの作成に失敗しました: {}", parent.display())
-            })?;
-            if parent_is_new {
-                harden_dir_permissions(parent)?;
-            }
+            ensure_db_dir(parent)?;
         }
     }
 
@@ -73,18 +59,65 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Restrict a freshly-created directory to owner-only access (0700).
-/// No-op on non-Unix targets, where this crate has no equivalent primitive.
+/// Ensure `dir` (the directory that will hold `tasks.db`/`-wal`/`-shm`)
+/// exists, creating it with owner-only permissions if we're the one
+/// creating it.
+///
+/// Task titles/descriptions can carry sensitive info, and on a shared
+/// multi-user machine the default directory mode (subject to umask,
+/// typically 0755) would let any local user read the db/wal/shm files
+/// inside by traversing into it. So: leave an already-existing `dir`
+/// untouched (its owner may have deliberately shared it), but if we create
+/// it fresh, restrict it to owner-only (0700).
+///
+/// Only `dir` itself gets the restrictive mode, not any missing ancestor
+/// directories above it — `AGENT_TASK_DB` could point deep into an
+/// unrelated shared path, and locking down directories this tool doesn't
+/// own would be a surprising side effect.
+fn ensure_db_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+
+    if let Some(ancestor) = dir.parent() {
+        if !ancestor.as_os_str().is_empty() {
+            std::fs::create_dir_all(ancestor).with_context(|| {
+                format!("ディレクトリの作成に失敗しました: {}", ancestor.display())
+            })?;
+        }
+    }
+
+    create_dir_owner_only(dir)
+        .with_context(|| format!("ディレクトリの作成に失敗しました: {}", dir.display()))
+}
+
+/// Create `dir` with owner-only (0700) permissions set atomically at
+/// creation time, rather than via a separate `chmod` afterward — a
+/// create-then-chmod sequence leaves a window where the directory briefly
+/// has the default, looser mode, which a co-resident local user could race
+/// to exploit. `AlreadyExists` is treated as success: this tool is designed
+/// for multiple concurrent agent processes sharing one DB, so another
+/// process may have won the race to create this same directory — and since
+/// it would have gone through this same function, it already has the
+/// right mode. No-op-equivalent fallback on non-Unix targets, which have no
+/// mode-on-create primitive here.
 #[cfg(unix)]
-fn harden_dir_permissions(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("ディレクトリの権限設定に失敗しました: {}", dir.display()))
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(not(unix))]
-fn harden_dir_permissions(_dir: &Path) -> Result<()> {
-    Ok(())
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
