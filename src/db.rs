@@ -305,10 +305,17 @@ pub fn list_tasks(conn: &Connection, filter: &ListFilter) -> Result<Vec<Task>> {
     }
 
     if let Some(tag) = &filter.tag {
+        // The stored side is compared with spaces stripped (`REPLACE(tags, '
+        // ', '')`), so the search term must be normalized the same way --
+        // otherwise "backend" and "back end" match inconsistently depending
+        // on which side of the comparison happens to have the space (a task
+        // tagged "back end" would wrongly match a search for "backend", while
+        // searching for "back end" itself would wrongly find nothing).
         // Escape LIKE wildcards (% and _) in user input so a tag like "50%"
         // or "a_b" is matched literally instead of as a pattern.
         sql.push_str(" AND (',' || REPLACE(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'");
-        params.push(Box::new(format!("%,{},%", escape_like(tag.trim()))));
+        let normalized_tag = tag.trim().replace(' ', "");
+        params.push(Box::new(format!("%,{},%", escape_like(&normalized_tag))));
     }
 
     sql.push_str(" ORDER BY \
@@ -650,6 +657,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(done.status, "done");
+    }
+
+    #[test]
+    fn tag_filter_normalizes_internal_spaces_like_stored_column() {
+        // Regression test for Issue #11: the stored side is compared with
+        // spaces stripped (`REPLACE(tags, ' ', '')`), so a filter of "backend"
+        // must also match a task whose tag is literally "back end", and a
+        // filter of "back end" must find it too -- both sides need the same
+        // normalization, not just the stored one.
+        let conn = mem_conn();
+        add_task(
+            &conn,
+            "A",
+            None,
+            "todo",
+            "medium",
+            None,
+            Some("back end,other"),
+            None,
+            "2026-07-26T00:00:00Z",
+        )
+        .unwrap();
+
+        for query in ["backend", "back end"] {
+            let matches = list_tasks(
+                &conn,
+                &ListFilter {
+                    tag: Some(query.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches.len(),
+                1,
+                "query {query:?} should match the \"back end\" tag"
+            );
+        }
     }
 
     #[test]
