@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,6 +48,11 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         }
     }
 
+    // Checked before `Connection::open` creates the file, so we only harden
+    // permissions on a file *we* just created, not one that already existed
+    // (which may have deliberately different permissions).
+    let db_is_new = !path.exists();
+
     let conn = Connection::open(path)
         .with_context(|| format!("データベースを開けませんでした: {}", path.display()))?;
 
@@ -56,7 +61,36 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
 
     init_schema(&conn)?;
+
+    if db_is_new {
+        harden_new_db_file_permissions(path)?;
+    }
+
     Ok(conn)
+}
+
+/// Restrict a freshly-created `tasks.db` to owner-only read/write (0600).
+/// The containing directory (see [`ensure_db_dir`]) is the primary access
+/// control (its 0700 mode already blocks traversal by other local users),
+/// but the file's own default, umask-derived mode is typically world- or
+/// group-readable, so this is defense in depth in case the directory's
+/// protection is ever bypassed or the directory is reused across a mode
+/// change. No-op on non-Unix targets, which have no equivalent primitive
+/// here.
+#[cfg(unix)]
+fn harden_new_db_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "DB ファイルのパーミッション設定に失敗しました: {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_new_db_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Ensure `dir` (the directory that will hold `tasks.db`/`-wal`/`-shm`)
@@ -67,16 +101,22 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 /// multi-user machine the default directory mode (subject to umask,
 /// typically 0755) would let any local user read the db/wal/shm files
 /// inside by traversing into it. So: leave an already-existing `dir`
-/// untouched (its owner may have deliberately shared it), but if we create
-/// it fresh, restrict it to owner-only (0700).
+/// untouched (its owner may have deliberately shared it) *as long as it is
+/// actually trustworthy* -- see [`check_dir_is_trustworthy`] -- but if we
+/// create it fresh, restrict it to owner-only (0700).
 ///
 /// Only `dir` itself gets the restrictive mode, not any missing ancestor
 /// directories above it — `AGENT_TASK_DB` could point deep into an
 /// unrelated shared path, and locking down directories this tool doesn't
 /// own would be a surprising side effect.
 fn ensure_db_dir(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => return check_dir_is_trustworthy(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("ディレクトリの確認に失敗しました: {}", dir.display()))
+        }
     }
 
     if let Some(ancestor) = dir.parent() {
@@ -88,7 +128,56 @@ fn ensure_db_dir(dir: &Path) -> Result<()> {
     }
 
     create_dir_owner_only(dir)
-        .with_context(|| format!("ディレクトリの作成に失敗しました: {}", dir.display()))
+        .with_context(|| format!("ディレクトリの作成に失敗しました: {}", dir.display()))?;
+
+    // `create_dir_owner_only` treats `AlreadyExists` as success, since
+    // several of our *own* processes may legitimately race to create the
+    // same brand-new directory. But `mkdir()` also returns `AlreadyExists`
+    // if literally anything (including a symlink an attacker planted in the
+    // window between the check above and this call) now occupies the path.
+    // Re-validate before trusting the result either way.
+    check_dir_is_trustworthy(dir)
+}
+
+/// Refuse to trust `dir` as the DB storage location if it is a symlink (it
+/// could silently redirect storage to a location outside our control, e.g.
+/// one an attacker fully owns) or, on Unix, if it is owned by a different
+/// user than the one running this process (it could be a directory another
+/// local user planted ahead of time at a predictable path). Task data can
+/// carry sensitive text, so a directory this tool did not itself create and
+/// cannot vouch for the origin of must not be used silently.
+fn check_dir_is_trustworthy(dir: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("ディレクトリの確認に失敗しました: {}", dir.display()))?;
+
+    if meta.file_type().is_symlink() {
+        bail!(
+            "DB ディレクトリ '{}' がシンボリックリンクです。信頼できない場所を指している可能性があるため使用を拒否します。シンボリックリンクを削除するか、AGENT_TASK_DB に実ディレクトリを指定してください。",
+            dir.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner_uid = meta.uid();
+        let running_uid = current_uid();
+        if owner_uid != running_uid {
+            bail!(
+                "DB ディレクトリ '{}' の所有者 (uid={owner_uid}) が実行ユーザー (uid={running_uid}) と一致しません。信頼できない可能性があるため使用を拒否します。",
+                dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid()` takes no arguments, performs no pointer
+    // dereferences, and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Create `dir` with owner-only (0700) permissions set atomically at
@@ -663,5 +752,38 @@ mod tests {
         assert!(delete_task(&conn, t.id).unwrap());
         assert!(get_task(&conn, t.id).unwrap().is_none());
         assert!(!delete_task(&conn, t.id).unwrap());
+    }
+
+    /// Regression test for Issue #10: a symlink pre-placed at the would-be DB
+    /// directory path must be rejected outright, not silently followed --
+    /// otherwise an attacker who can plant a symlink at a predictable path
+    /// (e.g. under a shared /tmp) before the victim's first run could
+    /// redirect task storage into a directory they fully control.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_db_dir_rejects_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let attacker_dir = tmp.path().join("attacker_controlled");
+        std::fs::create_dir(&attacker_dir).unwrap();
+
+        let link = tmp.path().join("victim_db_dir");
+        std::os::unix::fs::symlink(&attacker_dir, &link).unwrap();
+
+        let err = ensure_db_dir(&link).unwrap_err().to_string();
+        assert!(
+            err.contains("シンボリックリンク"),
+            "expected a symlink-rejection error, got: {err}"
+        );
+    }
+
+    /// A brand-new directory (no pre-existing path component at all) must
+    /// still be created normally -- the symlink/ownership check in
+    /// `check_dir_is_trustworthy` must not reject the common case.
+    #[test]
+    fn ensure_db_dir_creates_fresh_directory_normally() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("fresh");
+        ensure_db_dir(&dir).unwrap();
+        assert!(dir.is_dir());
     }
 }
