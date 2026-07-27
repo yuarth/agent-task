@@ -34,6 +34,13 @@
 | セキュリティ (PR #8 外部敵対的レビュー #3) | DB ディレクトリ作成のTOCTOU | 新規DBディレクトリの作成からパーミッション設定(0700)までの間に、緩い権限(umask依存)を持つ瞬間が存在しないこと。12並列プロセスによる同一ディレクトリへの初回同時作成でも、いずれのプロセスも失敗せず最終的に0700で確定すること | ✅ FIXED / PASS | 修正前は `create_dir_all`(既定パーミッションで作成)→事後`chmod`の2段階で、作成からchmodまでの間に緩い権限のウィンドウが存在した(CodeRabbitの自動レビューでも同一箇所を独立に指摘)。`std::os::unix::fs::DirBuilderExt::mode(0o700)` を用いて作成とパーミッション設定をアトミックに行うよう変更。`AlreadyExists` は成功として扱う(複数エージェントプロセスが同じ新規ディレクトリの作成を同時に試みる設計を前提とするため)。`tests/cli.rs::concurrent_fresh_directory_creation_does_not_fail_any_process` — 12並列プロセスでの初回同時作成で全プロセス成功・最終権限0700を確認。実バイナリでも `umask 022` 下での単発作成・12並列作成の双方を再検証し、いずれも0700であることを確認 |
 | 入力検証 (PR #8 外部敵対的レビュー #4) | ゼロ幅文字のみの `title` が空タイトル拒否をすり抜けないこと | U+200B等のゼロ幅文字のみ、または通常の空白とゼロ幅文字を交互に配置した `title` が拒否されること。一方で通常の可視文字を含む `title`(内部に空白を含むものを含む)は誤って拒否されないこと | ✅ FIXED / PASS | 1回目の修正(`width(title.trim()) == 0`)は純粋なゼロ幅文字のみのタイトル(例: U+200B×3)は正しく拒否したが、2回目の敵対的レビューで「`"  \u{200b}  \u{200b}  "` のように通常の空白とゼロ幅文字を交互に配置すると `.trim()` が最初の非空白(ゼロ幅)文字で停止し、内部の通常空白(表示幅を持つ)が未トリムのまま残るため、依然として視覚的に空白セルとして `list` に表示されるタスクが作成できてしまう」というバイパスが新たに発見された。`title.chars().filter(|c| !c.is_whitespace())` で空白文字を先頭・末尾に限らず全体から除去してから表示幅を判定するよう修正し、このバイパスを解消。`validate::tests::zero_width_spaces_interleaved_with_plain_spaces_are_rejected`, `interior_spaces_around_visible_text_are_still_accepted`, `tests/cli.rs::add_rejects_title_with_zero_width_chars_interleaved_with_spaces` で確認。実バイナリでもゼロ幅/不可視文字10種の単体テストに加え、乱数生成した60通りの組み合わせがいずれも正しく拒否され、かつ通常タイトル5種が誤って拒否されないことを確認 |
 
+| セキュリティ (第2巡敵対的監査 #1 / Issue #9) | Unicode双方向制御文字(RLO等)によるタイトル/タグ表示のなりすまし | `title`/`description`/`assigned`/`tags`/`due` に含まれる双方向書式文字 (`Cf`: U+202A-U+202E, U+2066-U+2069, U+200E, U+200F) が格納時に無害化されること | ✅ FIXED / PASS | 修正前は `sanitize::strip_ansi` が Unicode 制御文字 (`Cc`) のみを対象としており、`char::is_control()` が `false` を返す `Cf` カテゴリの双方向書式文字（U+202E RIGHT-TO-LEFT OVERRIDE 等）を除去できず、実バイナリで `add "safe‮exe.txt⁩"` を実行すると `show`/`list` の出力でタイトルが視覚的に反転して表示されることを確認した（"Trojan Source" 系のなりすまし手法、参考: CVE-2021-42574 と同クラス）。`src/sanitize.rs::is_bidi_control` を追加し `strip_ansi` の除去対象に組み込んだ（`description` を含む全フィールドで無条件に除去、`\n`/`\t` のような許容例外は設けない）。`sanitize::tests::clean_line_strips_rtl_override`, `clean_line_strips_all_bidi_control_chars`, `clean_multiline_strips_bidi_control_even_though_it_keeps_newlines_and_tabs`、`tests/cli.rs::bidi_override_characters_are_stripped_from_title`, `bidi_override_characters_are_stripped_from_assigned_and_tags` で確認 |
+| セキュリティ (第2巡敵対的監査 #2 / Issue #10) | DBディレクトリのシンボリックリンク/所有者不一致の信頼境界 | あらかじめ配置されたシンボリックリンクや、実行ユーザーと所有者が異なる既存ディレクトリを DB ディレクトリとして無条件に信頼しないこと。新規作成される `tasks.db` 自体も所有者のみ読み書き可能 (0600) であること | ✅ FIXED / PASS | 修正前は `ensure_db_dir` が `Path::exists()`（シンボリックリンクを解決してしまう）で存在確認しており、事前に配置されたシンボリックリンクを「既存ディレクトリ」として無条件に信頼し、リンク先（攻撃者が完全に制御するディレクトリ、実測で 0777）にそのまま `tasks.db` を書き込んでしまうことを実バイナリで確認した。`src/db.rs::check_dir_is_trustworthy` を追加し、`symlink_metadata` でシンボリックリンクを検出して拒否、Unix では所有者 uid が実行ユーザーと一致するかも検証するようにした。`create_dir_owner_only` の `AlreadyExists` 許容パス（複数の自プロセスが同一新規ディレクトリ作成を競合するケース向け）についても、作成後に改めて `check_dir_is_trustworthy` を通すことで、その隙間に攻撃者がシンボリックリンクを割り込ませるレースも塞いだ。あわせて `tasks.db` 本体も新規作成時のみ `0600` に制限する `harden_new_db_file_permissions` を追加（多層防御、既存ファイルの権限は変更しない）。`db::tests::ensure_db_dir_rejects_symlink`, `ensure_db_dir_creates_fresh_directory_normally`、`tests/cli.rs::db_directory_that_is_a_symlink_is_rejected`, `new_db_file_has_owner_only_permissions` で確認。所有者不一致のケースは異なる uid の生成に root 権限が必要なためテスト環境では自動テスト化していない |
+| 入力検証 (第2巡敵対的監査 #3 / Issue #11) | `tag` フィルタの空白正規化の非対称性 | タグ値内部に空白を含む場合でも、格納側・検索側で一貫した一致結果になること | ✅ FIXED / PASS | 修正前は格納側の比較のみ `REPLACE(tags, ' ', '')` で空白除去済みの値と比較する一方、検索側の `tag` 引数は `.trim()`（先頭/末尾のみ）しか適用しておらず、実バイナリで「`--tags "back end,other"` のタスクが `--tag "backend"` で誤ヒットする（誤マッチ）」「同じタスクが `--tag "back end"` では逆に0件になる（取りこぼし）」の両方を確認した。`src/db.rs::list_tasks` で検索側にも `tag.trim().replace(' ', "")` の同一正規化を適用し、両クエリが一貫して一致するよう修正。`db::tests::tag_filter_normalizes_internal_spaces_like_stored_column`、`tests/cli.rs::tag_filter_normalizes_internal_spaces_consistently` で確認 |
+| 堅牢性 (第2巡敵対的監査 #4 / Issue #12) | `update` の無変更呼び出しがサイレントに成功する | 変更対象フィールドを1つも指定しない `update <id>` が明確なエラーで拒否されること | ✅ FIXED / PASS | 修正前は `db::update_task` が常に `updated_at` を SET 句に含めるため、`agent-task update 1`（フィールド指定なし）が無条件に成功し `updated_at` のみが更新されることを実バイナリで確認した。エージェントによるフラグ指定ミス（値の渡し忘れ等）が気付かれずに「成功」してしまう問題があった。`src/main.rs::run_update` で全フィールドが `None` の場合に明確なエラーを返すよう修正。`tests/cli.rs::update_with_no_fields_is_rejected` で確認 |
+| 堅牢性 (第2巡敵対的監査 #5 / Issue #13 派生) | `--due` の極端な年(5桁以上)がビルドプロファイル間で挙動不一致 | `--due` の年が4桁でない値(例: `99999-01-01`)が、デバッグ/リリースいずれのビルドでも一貫して拒否されること | ✅ FIXED / PASS | `chrono` の `%Y`/RFC3339 パーサーが年の桁数を厳密に4桁に制限しておらず、内部の日付計算で整数オーバーフローが発生することを発見した。`cargo test`(デバッグビルド、オーバーフローチェック有効)では `--due 99999-01-01` が拒否される一方、`nix-build`/`cargo build --release`(オーバーフローチェック無効)で生成した実バイナリでは同じ値が無条件に受理されてしまうことを実測で確認した（テストスイートが実際の配布物と異なる挙動を検証してしまっていた）。`src/validate.rs::has_four_digit_year` を追加し、年部分が正確に4桁のASCII数字であることを `chrono` に渡す前に検証することで、ビルドプロファイルに依存しない決定論的な挙動にした。`validate::tests::due_date_rejects_year_with_more_than_four_digits`, `due_date_accepts_four_digit_year_boundaries`、`tests/cli.rs::due_date_with_more_than_four_digit_year_is_rejected_deterministically` で確認 |
+| テストカバレッジ (第2巡敵対的監査, Issue #13 残項目) | 同一行への並行 update/delete、不正UTF-8引数、`AGENT_TASK_DB` 異常系、結合文字大量連結 | いずれもクラッシュ(パニック/シグナル終了)せず、明確な成功/失敗として処理されること | ✅ PASS | `tests/cli.rs::concurrent_update_and_delete_on_same_row_do_not_crash`(同一行への update/delete 各10プロセスの競合), `invalid_utf8_argument_is_rejected_cleanly_without_panicking`(不正UTF-8バイト列を含む引数がclapレベルで明確に拒否されること), `agent_task_db_with_non_directory_parent_component_fails_cleanly`(`AGENT_TASK_DB` の親パス要素が通常ファイルの場合に明確なエラーになること), `title_heavy_with_combining_marks_does_not_crash_add_or_list`(結合文字400個の Zalgo 風タイトルで `add`/`list` がクラッシュしないこと) をそれぞれ追加し、いずれもクラッシュせず正常終了することを確認 |
+
 ## 実行コマンド一覧（再現用）
 
 ```bash
@@ -127,3 +134,36 @@ nix build .#default
 - `db::update_task` は事前の存在チェックを行わない。UPDATE文自体が
   存在しない ID に対して安全に 0 行影響で完了し、関数末尾の `get_task`
   が最終状態を正しく返すため、事前チェックは不要かつ冗長だった。
+- `sanitize::strip_ansi` は ANSI/C1 エスケープシーケンスおよび Unicode
+  制御文字 (`Cc`) に加え、双方向書式文字 (`Cf` の一部: U+202A-U+202E,
+  U+2066-U+2069, U+200E, U+200F) も除去する（`src/sanitize.rs::is_bidi_control`）。
+  これらは `char::is_control()` の対象外であるため別途チェックが必要で、
+  `description` を含む全フィールドで無条件に除去する（`\n`/`\t` のような
+  許容例外は設けない）。
+- DB ディレクトリは `Path::exists()`（シンボリックリンクを解決してしまう）
+  ではなく `symlink_metadata` で存在確認し、対象がシンボリックリンクで
+  あれば無条件に拒否する。既存の実ディレクトリを尊重する場合も、Unix では
+  所有者 uid が実行ユーザーと一致するかを確認し、一致しなければ拒否する
+  （`src/db.rs::check_dir_is_trustworthy`）。`create_dir_owner_only` の
+  `AlreadyExists` 許容（複数の自プロセスによる同一新規ディレクトリ作成の
+  競合を許容するため）についても、作成後に改めてこのチェックを通すことで、
+  その隙間に第三者がシンボリックリンクを割り込ませるレースを防いでいる。
+  新規作成される `tasks.db` 本体も、作成時のみ `0600` に制限する
+  （多層防御。既存ファイルの権限は変更しない）。
+- `tag` フィルタは検索側の入力にも格納側と同じ空白除去正規化
+  (`tag.trim().replace(' ', "")`) を適用してから `escape_like` に渡す。
+  格納側は `REPLACE(tags, ' ', '')` で空白を除去した値と比較するため、
+  検索側だけ空白を保持したままだと "backend" と "back end" が
+  一貫しない結果になっていた。
+- `update` は `title`/`description`/`status`/`priority`/`assigned`/`tags`/
+  `due` のいずれも指定されていない場合、明確なエラーで拒否する
+  （`db::update_task` は常に `updated_at` を更新するため、フィールド指定
+  なしの呼び出しでも無条件に「成功」してしまい、呼び出し側のミスが
+  気付かれなくなることを防ぐため）。
+- `--due` は `validate::has_four_digit_year` により、年部分が正確に4桁の
+  ASCII数字であることを `chrono` に渡す前に検証する。`chrono` の
+  `%Y`/RFC3339 パーサーは年の桁数を厳密に制限しておらず、5桁以上の年で
+  内部の日付計算が整数オーバーフローを起こす。オーバーフローチェックは
+  デバッグビルドでのみ有効なため、この事前検証がないと `cargo test`
+  (デバッグ) とリリースビルド(配布物)とで `--due` の受理/拒否が食い違う
+  ことを実測で確認した。
