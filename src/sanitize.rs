@@ -17,7 +17,11 @@
 //! RIGHT-TO-LEFT OVERRIDE), which are a distinct spoofing vector from ANSI
 //! escapes: they are not `Cc` control codes, so a naive `is_control()` check
 //! does not catch them, yet a compliant terminal will still visually reorder
-//! text around them -- see [`is_bidi_control`].
+//! text around them -- see [`is_bidi_control`]. U+2028/U+2029 (line/paragraph
+//! separators) are dropped unconditionally too, for the same reason `\n`/`\r`
+//! are: many renderers treat them as line breaks, which would let a
+//! single-line field render as multiple lines -- see
+//! [`is_line_or_paragraph_separator`].
 
 /// Max characters scanned after a CSI introducer while looking for a CSI
 /// final byte (0x40..=0x7E). Real CSI sequences are always short (a handful
@@ -89,7 +93,23 @@ fn is_bidi_control(c: char) -> bool {
         '\u{200e}' | '\u{200f}' // LRM, RLM
         | '\u{202a}'..='\u{202e}' // LRE, RLE, PDF, LRO, RLO
         | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+        | '\u{61c}' // ARABIC LETTER MARK: weaker than the above (only
+                     // influences neighboring neutral characters, doesn't
+                     // reorder text on its own), but the same `Cf` spoofing
+                     // class, so dropped for the same reason.
     )
+}
+
+/// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are General Category
+/// `Zl`/`Zp` -- not `Cc` (so `is_control()` misses them) and not `Cf` (so
+/// [`is_bidi_control`] misses them either). Many terminals and other
+/// renderers (browsers, log viewers, ...) treat them as line/paragraph
+/// breaks, which reproduces the exact "single-line field renders as
+/// multiple lines" problem that motivated stripping `\n`/`\r` from these
+/// fields in the first place, just via a different codepoint (found in
+/// outer adversarial review of PR #14).
+fn is_line_or_paragraph_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
@@ -127,7 +147,10 @@ fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
             continue;
         }
 
-        if (c.is_control() && !keep_control(c)) || is_bidi_control(c) {
+        if (c.is_control() && !keep_control(c))
+            || is_bidi_control(c)
+            || is_line_or_paragraph_separator(c)
+        {
             i += 1;
             continue;
         }
@@ -306,6 +329,32 @@ mod tests {
     fn clean_multiline_strips_bidi_control_even_though_it_keeps_newlines_and_tabs() {
         let malicious = "line1\u{202e}\nline2";
         assert_eq!(clean_multiline(malicious), "line1\nline2");
+    }
+
+    #[test]
+    fn clean_line_strips_arabic_letter_mark() {
+        assert_eq!(clean_line("a\u{61c}b"), "ab");
+    }
+
+    #[test]
+    fn clean_line_strips_line_and_paragraph_separators() {
+        // Found in outer adversarial review of PR #14: U+2028/U+2029 are
+        // General Category Zl/Zp, not Cc (is_control() misses them) and not
+        // Cf (is_bidi_control() misses them too), so they survived into
+        // stored title/tags/assigned/due values. Many terminals/renderers
+        // treat them as line breaks, reproducing the same table-corruption
+        // concern that motivated stripping \n/\r in the first place.
+        let input = "line1\u{2028}line2\u{2029}line3";
+        assert_eq!(clean_line(input), "line1line2line3");
+    }
+
+    #[test]
+    fn clean_multiline_strips_line_and_paragraph_separators_too() {
+        // Unlike \n/\t, these are always stripped even in multiline fields --
+        // matching the existing precedent for other non-\n/\t control-like
+        // characters (e.g. U+0085 NEL is already stripped from description).
+        let input = "line1\u{2028}line2\nline3";
+        assert_eq!(clean_multiline(input), "line1line2\nline3");
     }
 
     #[test]

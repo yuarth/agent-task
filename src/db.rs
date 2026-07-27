@@ -48,6 +48,25 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         }
     }
 
+    // Refuse to follow a symlink planted at the exact DB file path. This
+    // matters even inside a directory `ensure_db_dir` otherwise trusts: a
+    // shared, sticky-bit directory like `/tmp` still lets *any* local user
+    // create a brand-new entry with a name they can predict (the sticky bit
+    // only stops non-owners from deleting/replacing an entry someone else
+    // already created) -- e.g. pre-planting `/tmp/my-tasks.db` as a symlink
+    // to an arbitrary file before the victim's first run. `symlink_metadata`
+    // reports symlink-ness without following the link, so this also catches
+    // a dangling symlink (whose target doesn't exist, but which `exists()`
+    // below wouldn't flag as needing this check on its own).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "DB ファイル '{}' がシンボリックリンクです。信頼できない場所を指している可能性があるため使用を拒否します。",
+                path.display()
+            );
+        }
+    }
+
     // Checked before `Connection::open` creates the file, so we only harden
     // permissions on a file *we* just created, not one that already existed
     // (which may have deliberately different permissions).
@@ -105,10 +124,12 @@ fn harden_new_db_file_permissions(_path: &Path) -> Result<()> {
 /// actually trustworthy* -- see [`check_dir_is_trustworthy`] -- but if we
 /// create it fresh, restrict it to owner-only (0700).
 ///
-/// Only `dir` itself gets the restrictive mode, not any missing ancestor
-/// directories above it — `AGENT_TASK_DB` could point deep into an
-/// unrelated shared path, and locking down directories this tool doesn't
-/// own would be a surprising side effect.
+/// The immediate ancestor of `dir` is checked the same way if it already
+/// exists (closing the gap where a symlink planted one level *above* `dir`,
+/// rather than at `dir` itself, would otherwise still redirect storage), but
+/// no further up than that -- `AGENT_TASK_DB` could point deep into an
+/// unrelated shared path, and locking down directories this tool doesn't own
+/// would be a surprising side effect.
 fn ensure_db_dir(dir: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dir) {
         Ok(_) => return check_dir_is_trustworthy(dir),
@@ -121,6 +142,9 @@ fn ensure_db_dir(dir: &Path) -> Result<()> {
 
     if let Some(ancestor) = dir.parent() {
         if !ancestor.as_os_str().is_empty() {
+            if std::fs::symlink_metadata(ancestor).is_ok() {
+                check_dir_is_trustworthy(ancestor)?;
+            }
             std::fs::create_dir_all(ancestor).with_context(|| {
                 format!("ディレクトリの作成に失敗しました: {}", ancestor.display())
             })?;
@@ -139,21 +163,43 @@ fn ensure_db_dir(dir: &Path) -> Result<()> {
     check_dir_is_trustworthy(dir)
 }
 
-/// Refuse to trust `dir` as the DB storage location if it is a symlink (it
-/// could silently redirect storage to a location outside our control, e.g.
-/// one an attacker fully owns) or, on Unix, if it is owned by a different
-/// user than the one running this process (it could be a directory another
-/// local user planted ahead of time at a predictable path). Task data can
-/// carry sensitive text, so a directory this tool did not itself create and
-/// cannot vouch for the origin of must not be used silently.
+/// Refuse to trust `dir` as a DB storage location unless it resolves (after
+/// following any symlinks) to a real directory that is either owned by the
+/// user running this process, or -- on Unix -- carries the sticky bit
+/// (mode `01000`). The sticky bit is the standard Unix convention for a
+/// directory that is safe to share with untrusted local users (`/tmp`,
+/// `/var/tmp`, ...): it stops anyone but an entry's own owner (or root) from
+/// deleting or renaming it, which is exactly the property that makes a
+/// shared directory usable as a parent for files this tool itself creates
+/// and owns.
+///
+/// `dir` itself may be a symlink -- e.g. macOS's `/tmp` is a symlink to
+/// `/private/tmp` -- what matters is whether the *resolved* target is
+/// trustworthy, not whether reaching it involved a symlink. An earlier
+/// version of this check rejected any symlink and any non-owned directory
+/// outright, which broke this project's own documented
+/// `AGENT_TASK_DB=/tmp/my-tasks.db` example: `/tmp` is a symlink on macOS
+/// and root-owned (not the invoking user) on typical Linux systems, so that
+/// exact command failed on both (found in outer adversarial review of PR
+/// #14). Task data can still carry sensitive text, so this only relaxes the
+/// check to the standard "sticky shared directory" case -- an attacker's own
+/// unprivileged directory (not owned by the running user, sticky bit not
+/// set, as an unprivileged user cannot chown to another uid or usefully fake
+/// this combination) is still rejected. A predictable *file* name inside a
+/// trusted shared directory is separately guarded in [`open_db`], since the
+/// sticky bit alone doesn't stop another local user from creating a
+/// brand-new entry there before this tool's first run.
 fn check_dir_is_trustworthy(dir: &Path) -> Result<()> {
-    let meta = std::fs::symlink_metadata(dir)
+    let real = std::fs::canonicalize(dir)
         .with_context(|| format!("ディレクトリの確認に失敗しました: {}", dir.display()))?;
+    let meta = std::fs::metadata(&real)
+        .with_context(|| format!("ディレクトリの確認に失敗しました: {}", real.display()))?;
 
-    if meta.file_type().is_symlink() {
+    if !meta.is_dir() {
         bail!(
-            "DB ディレクトリ '{}' がシンボリックリンクです。信頼できない場所を指している可能性があるため使用を拒否します。シンボリックリンクを削除するか、AGENT_TASK_DB に実ディレクトリを指定してください。",
-            dir.display()
+            "DB ディレクトリ '{}' (実体: '{}') はディレクトリではありません",
+            dir.display(),
+            real.display()
         );
     }
 
@@ -162,10 +208,14 @@ fn check_dir_is_trustworthy(dir: &Path) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let owner_uid = meta.uid();
         let running_uid = current_uid();
-        if owner_uid != running_uid {
+        let has_sticky_bit = meta.mode() & 0o1000 != 0;
+        if owner_uid != running_uid && !has_sticky_bit {
             bail!(
-                "DB ディレクトリ '{}' の所有者 (uid={owner_uid}) が実行ユーザー (uid={running_uid}) と一致しません。信頼できない可能性があるため使用を拒否します。",
-                dir.display()
+                "DB ディレクトリ '{}' (実体: '{}') の所有者 (uid={owner_uid}) が実行ユーザー \
+                 (uid={running_uid}) と一致せず、共有ディレクトリを示すスティッキービットも \
+                 設定されていません。信頼できない可能性があるため使用を拒否します。",
+                dir.display(),
+                real.display()
             );
         }
     }
@@ -799,26 +849,100 @@ mod tests {
         assert!(!delete_task(&conn, t.id).unwrap());
     }
 
-    /// Regression test for Issue #10: a symlink pre-placed at the would-be DB
-    /// directory path must be rejected outright, not silently followed --
-    /// otherwise an attacker who can plant a symlink at a predictable path
-    /// (e.g. under a shared /tmp) before the victim's first run could
-    /// redirect task storage into a directory they fully control.
+    /// Regression test for outer adversarial review of PR #14: an earlier
+    /// version of `check_dir_is_trustworthy` rejected *any* symlink
+    /// unconditionally, which broke this project's own documented
+    /// `AGENT_TASK_DB=/tmp/my-tasks.db` example (`/tmp` is a symlink to
+    /// `/private/tmp` on macOS). A symlink to a directory the running user
+    /// already owns must be accepted -- what matters is the trustworthiness
+    /// of the resolved target, not whether a symlink was involved.
     #[cfg(unix)]
     #[test]
-    fn ensure_db_dir_rejects_symlink() {
+    fn ensure_db_dir_accepts_symlink_to_owned_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let attacker_dir = tmp.path().join("attacker_controlled");
-        std::fs::create_dir(&attacker_dir).unwrap();
+        let real_dir = tmp.path().join("relocated_storage");
+        std::fs::create_dir(&real_dir).unwrap();
 
-        let link = tmp.path().join("victim_db_dir");
-        std::os::unix::fs::symlink(&attacker_dir, &link).unwrap();
+        let link = tmp.path().join("db_dir_symlink");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
 
-        let err = ensure_db_dir(&link).unwrap_err().to_string();
-        assert!(
-            err.contains("シンボリックリンク"),
-            "expected a symlink-rejection error, got: {err}"
-        );
+        ensure_db_dir(&link).unwrap();
+    }
+
+    /// Direct regression test for the actual reported bug: a sticky-bit
+    /// shared directory (the standard Unix convention for a directory safe
+    /// to share with untrusted local users, e.g. `/tmp` itself, mode 01777)
+    /// must be usable as the DB directory even though it isn't owned by the
+    /// running user. Without this, `AGENT_TASK_DB=/tmp/my-tasks.db` fails on
+    /// any system where `/tmp` isn't owned by the invoking user (i.e. nearly
+    /// everywhere -- `/tmp` is normally root-owned).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_db_dir_accepts_sticky_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared = tmp.path().join("shared_tmp_like");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        ensure_db_dir(&shared).unwrap();
+    }
+
+    /// A dangling symlink (target doesn't exist) must be rejected with a
+    /// clear error, not panic.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_db_dir_rejects_dangling_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("dangling_link");
+        std::os::unix::fs::symlink(tmp.path().join("does_not_exist"), &link).unwrap();
+
+        assert!(ensure_db_dir(&link).is_err());
+    }
+
+    /// A symlink pointing at a regular *file* (not a directory) is an
+    /// invalid configuration and must be rejected with a clear error rather
+    /// than silently misbehaving later when SQLite tries to treat it as a
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_db_dir_rejects_symlink_to_non_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let regular_file = tmp.path().join("just_a_file");
+        std::fs::write(&regular_file, b"not a directory").unwrap();
+
+        let link = tmp.path().join("link_to_file");
+        std::os::unix::fs::symlink(&regular_file, &link).unwrap();
+
+        assert!(ensure_db_dir(&link).is_err());
+    }
+
+    /// A symlink placed one level *above* the DB-holding directory (rather
+    /// than at the DB directory itself) must be subject to the same
+    /// trust check -- otherwise it silently redirects storage exactly like a
+    /// symlink at the DB directory itself would (found in outer adversarial
+    /// review of PR #14: only `dir` itself was checked, never
+    /// `dir.parent()`). Here the resolved ancestor is owned by the running
+    /// user (the only case a single-user test can construct without root),
+    /// so it must be accepted -- the important behavioral change is that the
+    /// ancestor is actually *inspected* at all now, matching `dir`'s
+    /// existing protection instead of being skipped entirely.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_db_dir_checks_immediate_ancestor_symlink_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_ancestor = tmp.path().join("real_ancestor");
+        std::fs::create_dir(&real_ancestor).unwrap();
+
+        let ancestor_link = tmp.path().join("ancestor_link");
+        std::os::unix::fs::symlink(&real_ancestor, &ancestor_link).unwrap();
+
+        // `dir` itself (the DB-holding directory) doesn't exist yet -- it
+        // sits one level below the symlinked ancestor.
+        let dir = ancestor_link.join("db_subdir");
+        ensure_db_dir(&dir).unwrap();
+        assert!(real_ancestor.join("db_subdir").is_dir());
     }
 
     /// A brand-new directory (no pre-existing path component at all) must

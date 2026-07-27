@@ -716,32 +716,126 @@ fn bidi_override_characters_are_stripped_from_assigned_and_tags() {
     assert_eq!(value["tags"], "backend");
 }
 
-/// Regression test for Issue #10: a symlink pre-placed at the path where the
-/// DB directory would be created must not be silently trusted and followed
-/// -- otherwise an attacker who can plant a symlink at a predictable path
-/// (e.g. under a shared /tmp) before the victim's first run can redirect
-/// task storage into a directory they fully control.
+/// Regression test found in outer adversarial review of PR #14: U+2028
+/// LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are neither `Cc` (missed by
+/// `is_control()`) nor `Cf` (missed by `is_bidi_control()`), so they
+/// survived into a stored title unstripped. Many terminals/renderers treat
+/// them as line breaks, breaking the single-line-field invariant the same
+/// way an embedded `\n` would.
+#[test]
+fn line_and_paragraph_separators_are_stripped_from_title() {
+    let (_dir, db) = new_db();
+    let title = "line1\u{2028}line2\u{2029}line3";
+    cmd(&db).args(["add", title]).assert().success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored_title = value["title"].as_str().unwrap();
+    assert!(!stored_title.contains('\u{2028}'));
+    assert!(!stored_title.contains('\u{2029}'));
+    assert_eq!(stored_title, "line1line2line3");
+}
+
+/// Regression test for the outer adversarial review of PR #14: the DB
+/// directory being a *sticky-bit shared directory* (mode 01777, the standard
+/// Unix convention for something like `/tmp` -- safe to share with
+/// untrusted local users because only an entry's own owner or root can
+/// delete/rename it) must work end to end, even though it isn't owned by
+/// the invoking user. This directly reproduces README.md's own documented
+/// `AGENT_TASK_DB=/tmp/my-tasks.db` example, which an earlier version of
+/// this fix broke outright (confirmed against the built binary: `/tmp` is a
+/// symlink to `/private/tmp` on macOS, and root-owned on typical Linux
+/// systems -- either way, not owned by the invoking user).
 #[cfg(unix)]
 #[test]
-fn db_directory_that_is_a_symlink_is_rejected() {
-    let dir = TempDir::new().unwrap();
-    let attacker_dir = dir.path().join("attacker_controlled");
-    std::fs::create_dir(&attacker_dir).unwrap();
+fn agent_task_db_directly_in_sticky_shared_directory_works_end_to_end() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let link = dir.path().join("victim_db_dir");
-    std::os::unix::fs::symlink(&attacker_dir, &link).unwrap();
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("tmp_like_shared_dir");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+    let db = shared.join("my-tasks.db");
+    cmd(&db)
+        .args(["add", "readme example reproduction"])
+        .assert()
+        .success();
+    cmd(&db)
+        .args(["show", "1", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("readme example reproduction"));
+}
+
+/// A symlink at the DB directory path pointing to a directory the invoking
+/// user already owns must be accepted, not rejected outright -- an earlier
+/// version of this check rejected *any* symlink unconditionally, which is
+/// what broke the sticky-shared-directory case above on macOS (`/tmp` is
+/// itself a symlink there).
+#[cfg(unix)]
+#[test]
+fn db_directory_symlink_to_owned_directory_works_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let real_dir = dir.path().join("relocated_storage");
+    std::fs::create_dir(&real_dir).unwrap();
+    let link = dir.path().join("db_dir_symlink");
+    std::os::unix::fs::symlink(&real_dir, &link).unwrap();
 
     let db = link.join("tasks.db");
+    cmd(&db).args(["add", "T"]).assert().success();
+    assert!(real_dir.join("tasks.db").exists());
+}
+
+/// A symlink placed *at the exact tasks.db file path* (as opposed to at the
+/// containing directory) must still be rejected, even inside an otherwise
+/// trusted directory -- a sticky shared directory like `/tmp` still lets any
+/// local user create a brand-new entry there with a name they can predict,
+/// since the sticky bit only stops deleting/replacing an entry someone else
+/// already owns.
+#[cfg(unix)]
+#[test]
+fn db_file_itself_being_a_symlink_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let attacker_target = dir.path().join("attacker_target_file");
+    std::fs::write(&attacker_target, b"pre-existing unrelated file").unwrap();
+
+    let db = dir.path().join("tasks.db");
+    std::os::unix::fs::symlink(&attacker_target, &db).unwrap();
+
     cmd(&db)
         .args(["add", "T"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("シンボリックリンク"));
 
-    assert!(
-        !attacker_dir.join("tasks.db").exists(),
-        "task data must not be written through a pre-planted symlink"
+    let contents = std::fs::read(&attacker_target).unwrap();
+    assert_eq!(
+        contents, b"pre-existing unrelated file",
+        "the symlink target must not be written through"
     );
+}
+
+/// A symlink placed one level *above* the DB-holding directory must be
+/// subject to the same trust check as the DB directory itself -- otherwise
+/// it silently redirects storage the same way a symlink at the DB directory
+/// would (found in outer adversarial review of PR #14: only the immediate
+/// DB directory was checked, never its parent).
+#[cfg(unix)]
+#[test]
+fn ancestor_directory_symlink_is_checked_too() {
+    let dir = TempDir::new().unwrap();
+    let real_ancestor = dir.path().join("real_ancestor");
+    std::fs::create_dir(&real_ancestor).unwrap();
+    let ancestor_link = dir.path().join("ancestor_link");
+    std::os::unix::fs::symlink(&real_ancestor, &ancestor_link).unwrap();
+
+    // The DB-holding directory itself doesn't exist yet -- it sits one
+    // level below the symlinked ancestor, so only the ancestor check (not
+    // the DB-directory check) can catch a problem here.
+    let db = ancestor_link.join("subdir").join("tasks.db");
+    cmd(&db).args(["add", "T"]).assert().success();
+    assert!(real_ancestor.join("subdir").join("tasks.db").exists());
 }
 
 /// A freshly-created `tasks.db` file itself must be owner-only (0600), as
@@ -899,16 +993,12 @@ fn agent_task_db_with_non_directory_parent_component_fails_cleanly() {
         .stderr(predicate::str::contains("ディレクトリ"));
 }
 
-/// Regression test for a build-profile-dependent inconsistency found in the
-/// second round of adversarial audit: `chrono`'s `%Y`/RFC3339 parsers accept
-/// a variable-width year and hit internal integer-overflow arithmetic for
-/// pathological years (5+ digits) -- checked arithmetic surfaced this as a
-/// parse failure under `cargo test` (debug), but the release/Nix-built
-/// binary (overflow checks disabled) silently *accepted* the same
-/// `--due 99999-01-01`. `validate::has_four_digit_year` now rejects
-/// non-4-digit years before they ever reach `chrono`, so acceptance is
-/// deterministic regardless of build profile. Ordinary 4-digit-year
-/// boundaries must still be accepted.
+/// `--due` values with a year longer than 4 digits must be rejected end to
+/// end, for both the plain-date and RFC3339 forms, while ordinary 4-digit
+/// boundaries are still accepted (see `validate::has_four_digit_year`'s doc
+/// comment: an earlier version of this comment incorrectly attributed this
+/// check to a debug/release build inconsistency in `chrono` that, on
+/// careful re-verification, does not actually exist).
 #[test]
 fn due_date_with_more_than_four_digit_year_is_rejected_deterministically() {
     let (_dir, db) = new_db();

@@ -56,19 +56,28 @@ pub fn check_max_len(value: &str, field_name: &str, max_chars: usize) -> Result<
     Ok(())
 }
 
-/// `chrono`'s `%Y` (used for the plain-date form) and its RFC3339 parser both
-/// accept a variable-width year rather than strictly requiring 4 digits, and
-/// hit internal integer-overflow arithmetic for pathological years (5+
-/// digits). Checked arithmetic makes that surface as a parse failure in a
-/// debug build, but release builds disable overflow checks by default, so
-/// the same input can be silently *accepted* there instead -- observed
-/// directly: `--due 99999-01-01` was rejected under `cargo test` (debug) but
-/// accepted by the `cargo build --release`/Nix-built binary. Both accepted
-/// formats always start with a 4-digit year followed by `-`
-/// (`YYYY-MM-DD...`, per the documented shapes), so rejecting anything else
-/// up front -- before the value ever reaches `chrono` -- removes the
-/// ambiguity entirely and makes acceptance deterministic across build
-/// profiles.
+/// Require the year portion of `value` to be exactly 4 ASCII digits, as
+/// documented for `--due` (`YYYY-MM-DD` / RFC3339, both of which specify a
+/// 4-digit year). `chrono`'s `%Y` (plain-date form) and its RFC3339 parser
+/// both correctly reject a 5+-digit year on their own -- confirmed directly
+/// against this crate's pinned `chrono` version in both debug and release
+/// builds, so there is no cross-build-profile inconsistency to guard
+/// against here. This check exists purely to enforce the documented format
+/// strictly and explicitly, rather than relying on `chrono`'s own
+/// (correct, but not contractually guaranteed by this crate's public API)
+/// rejection behavior for out-of-shape input.
+///
+/// Correction: an earlier version of this comment claimed `chrono` accepted
+/// `--due 99999-01-01` in a release build while rejecting it in a debug
+/// build, attributing this to integer-overflow arithmetic disabled by
+/// release-mode optimizations. That claim was wrong -- it came from
+/// comparing a freshly-built debug binary against a *stale* Nix build
+/// artifact left over from before this project's very first round of
+/// input-validation fixes (which had no `--due` format validation at all),
+/// not a properly rebuilt release binary of matching source. Rebuilding
+/// both profiles cleanly from the same source shows `chrono` rejects
+/// `99999-01-01` identically in both (found during outer adversarial review
+/// of PR #14).
 fn has_four_digit_year(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() > 4 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-'
@@ -204,14 +213,11 @@ mod tests {
         assert!(validate_due_date("9999-12-31").is_ok());
     }
 
-    /// Regression test for a build-profile-dependent inconsistency found in
-    /// the second round of adversarial audit: without an explicit 4-digit
-    /// year check, `--due 99999-01-01` was rejected under `cargo test`
-    /// (debug, checked arithmetic) but *accepted* by the release/Nix-built
-    /// binary (overflow checks disabled), because chrono's `%Y`/RFC3339
-    /// parsers accept a variable-width year and hit internal overflow for
-    /// pathological years. Both forms must now be rejected deterministically
-    /// regardless of build profile.
+    /// A year with more than 4 digits must be rejected for both the
+    /// plain-date and RFC3339 forms, matching the documented `YYYY-MM-DD`
+    /// shape strictly (see [`has_four_digit_year`] for why this is checked
+    /// explicitly rather than left to `chrono`'s own -- already correct --
+    /// rejection of such input).
     #[test]
     fn due_date_rejects_year_with_more_than_four_digits() {
         assert!(validate_due_date("99999-01-01").is_err());
