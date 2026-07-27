@@ -44,9 +44,7 @@ pub fn resolve_db_path() -> Result<PathBuf> {
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("ディレクトリの作成に失敗しました: {}", parent.display())
-            })?;
+            ensure_db_dir(parent)?;
         }
     }
 
@@ -59,6 +57,67 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
     init_schema(&conn)?;
     Ok(conn)
+}
+
+/// Ensure `dir` (the directory that will hold `tasks.db`/`-wal`/`-shm`)
+/// exists, creating it with owner-only permissions if we're the one
+/// creating it.
+///
+/// Task titles/descriptions can carry sensitive info, and on a shared
+/// multi-user machine the default directory mode (subject to umask,
+/// typically 0755) would let any local user read the db/wal/shm files
+/// inside by traversing into it. So: leave an already-existing `dir`
+/// untouched (its owner may have deliberately shared it), but if we create
+/// it fresh, restrict it to owner-only (0700).
+///
+/// Only `dir` itself gets the restrictive mode, not any missing ancestor
+/// directories above it — `AGENT_TASK_DB` could point deep into an
+/// unrelated shared path, and locking down directories this tool doesn't
+/// own would be a surprising side effect.
+fn ensure_db_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+
+    if let Some(ancestor) = dir.parent() {
+        if !ancestor.as_os_str().is_empty() {
+            std::fs::create_dir_all(ancestor).with_context(|| {
+                format!("ディレクトリの作成に失敗しました: {}", ancestor.display())
+            })?;
+        }
+    }
+
+    create_dir_owner_only(dir)
+        .with_context(|| format!("ディレクトリの作成に失敗しました: {}", dir.display()))
+}
+
+/// Create `dir` with owner-only (0700) permissions set atomically at
+/// creation time, rather than via a separate `chmod` afterward — a
+/// create-then-chmod sequence leaves a window where the directory briefly
+/// has the default, looser mode, which a co-resident local user could race
+/// to exploit. `AlreadyExists` is treated as success: this tool is designed
+/// for multiple concurrent agent processes sharing one DB, so another
+/// process may have won the race to create this same directory — and since
+/// it would have gone through this same function, it already has the
+/// right mode. No-op-equivalent fallback on non-Unix targets, which have no
+/// mode-on-create primitive here.
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -190,10 +249,10 @@ pub fn update_task(
     due: Option<&str>,
     now: &str,
 ) -> Result<Option<Task>> {
-    if get_task(conn, id)?.is_none() {
-        return Ok(None);
-    }
-
+    // No separate existence pre-check: UPDATE against a non-existent id
+    // safely affects zero rows (no error), and the final `get_task` below
+    // already reports the correct Some/None either way — a pre-check here
+    // would just be a second, redundant query.
     let mut sets: Vec<String> = vec!["updated_at = ?".to_string()];
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.to_string())];
 

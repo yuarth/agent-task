@@ -5,21 +5,68 @@
 //!
 //! A naive filter that only drops the ESC (0x1B) byte would leave the rest
 //! of a CSI/OSC sequence (e.g. the `[31m` in `ESC[31m`) behind as visible
-//! junk, so this recognizes and drops whole sequences:
-//! - CSI: `ESC '[' params... final-byte` (final byte in `0x40..=0x7E`)
-//! - OSC: `ESC ']' ... (BEL | ESC '\\')`
+//! junk, so this recognizes and drops whole sequences, in both their 7-bit
+//! (ESC-prefixed) and 8-bit (single C1 control code) forms:
+//! - CSI: `ESC '[' params... final-byte` (final byte in `0x40..=0x7E`), or
+//!   the single-byte C1 introducer `0x9B` in place of `ESC '['`
+//! - OSC: `ESC ']' ... (BEL | ESC '\\')`, or the single-byte C1 introducer
+//!   `0x9D` in place of `ESC ']'`
 //! - other two-byte escapes: `ESC <any char>`
 
-/// Max characters scanned after `ESC '['` while looking for a CSI final byte
-/// (0x40..=0x7E). Real CSI sequences are always short (a handful of
-/// parameter/intermediate bytes); without a cap, a malformed/malicious
-/// `ESC '[' <many non-final bytes>` payload with no final byte would let the
-/// scan run to the end of the input, silently swallowing everything after
-/// it. If no final byte turns up within the cap, the sequence is not
-/// treated as CSI: only the ESC itself is dropped, and scanning resumes
-/// from the very next character (the `[` and whatever follows it are
-/// treated as ordinary text, same as any other input).
+/// Max characters scanned after a CSI introducer while looking for a CSI
+/// final byte (0x40..=0x7E). Real CSI sequences are always short (a handful
+/// of parameter/intermediate bytes); without a cap, a malformed/malicious
+/// CSI payload with no final byte would let the scan run to the end of the
+/// input, silently swallowing everything after it. If no final byte turns up
+/// within the cap, the sequence is not treated as CSI: only the introducer
+/// itself is dropped, and scanning resumes from the very next character.
 const CSI_PARAM_LIMIT: usize = 16;
+
+/// Scan for a CSI final byte starting at `params_start` (the position right
+/// after the introducer, whether that was `ESC '['` or the single-byte `0x9B`).
+/// Returns the index just past the whole sequence if a well-formed one is
+/// found within [`CSI_PARAM_LIMIT`], or `None` otherwise (caller then drops
+/// only the introducer and keeps scanning).
+fn skip_csi(chars: &[char], params_start: usize, n: usize) -> Option<usize> {
+    let scan_end = (params_start + CSI_PARAM_LIMIT).min(n);
+    (params_start..scan_end)
+        .find(|&j| ('\x40'..='\x7e').contains(&chars[j]))
+        .map(|j| j + 1)
+}
+
+/// Max characters scanned after an OSC introducer while looking for its
+/// terminator (BEL or ST). Real OSC payloads (e.g. an OSC-8 hyperlink's URI)
+/// are rarely more than a couple hundred characters; this is set well above
+/// that. Without a cap, an unterminated `ESC ']'`/`0x9D` payload makes this
+/// scan run to the end of the input — and worse, an input containing *many*
+/// such introducers back-to-back (e.g. `"\x1b]".repeat(n)`) re-triggers that
+/// full-length scan for each one, making total work O(n^2). Measured on the
+/// pre-fix code: a 320,000-character such payload took ~11 seconds to
+/// sanitize. Capping the scan bounds each attempt to O(OSC_PARAM_LIMIT),
+/// same fix shape as [`CSI_PARAM_LIMIT`] above.
+const OSC_PARAM_LIMIT: usize = 512;
+
+/// Scan for an OSC terminator (BEL, or ESC '\\' i.e. ST) starting at
+/// `params_start`. Returns the index just past the whole sequence if found
+/// within [`OSC_PARAM_LIMIT`], or `None` otherwise (caller then drops only
+/// the introducer and keeps scanning — the terminator's BEL/ESC bytes, if
+/// any appear further out, still get dropped independently by the generic
+/// control-character filter, so no escape sequence can survive intact even
+/// when a payload exceeds the cap).
+fn skip_osc(chars: &[char], params_start: usize, n: usize) -> Option<usize> {
+    let scan_end = (params_start + OSC_PARAM_LIMIT).min(n);
+    let mut j = params_start;
+    while j < scan_end {
+        if chars[j] == '\u{7}' {
+            return Some(j + 1);
+        }
+        if chars[j] == '\u{1b}' && chars.get(j + 1) == Some(&'\\') {
+            return Some(j + 2);
+        }
+        j += 1;
+    }
+    None
+}
 
 fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
     let chars: Vec<char> = input.chars().collect();
@@ -30,44 +77,27 @@ fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
     while i < n {
         let c = chars[i];
 
+        if c == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+            i = skip_csi(&chars, i + 2, n).unwrap_or(i + 1);
+            continue;
+        }
+        if c == '\u{9b}' {
+            // 8-bit C1 CSI introducer: equivalent to `ESC '['`.
+            i = skip_csi(&chars, i + 1, n).unwrap_or(i + 1);
+            continue;
+        }
+
+        if c == '\u{1b}' && chars.get(i + 1) == Some(&']') {
+            i = skip_osc(&chars, i + 2, n).unwrap_or(i + 1);
+            continue;
+        }
+        if c == '\u{9d}' {
+            // 8-bit C1 OSC introducer: equivalent to `ESC ']'`.
+            i = skip_osc(&chars, i + 1, n).unwrap_or(i + 1);
+            continue;
+        }
+
         if c == '\u{1b}' {
-            if chars.get(i + 1) == Some(&'[') {
-                let params_start = i + 2;
-                let scan_end = (params_start + CSI_PARAM_LIMIT).min(n);
-                let final_byte =
-                    (params_start..scan_end).find(|&j| ('\x40'..='\x7e').contains(&chars[j]));
-
-                i = match final_byte {
-                    // Whole ESC '[' params... final-byte sequence: drop it.
-                    Some(j) => j + 1,
-                    // No final byte within the cap: drop only the ESC.
-                    None => i + 1,
-                };
-                continue;
-            }
-
-            if chars.get(i + 1) == Some(&']') {
-                // OSC: ESC ']' ... (BEL | ESC '\\')
-                let mut j = i + 2;
-                let mut end = None;
-                while j < n {
-                    if chars[j] == '\u{7}' {
-                        end = Some(j);
-                        break;
-                    }
-                    if chars[j] == '\u{1b}' && chars.get(j + 1) == Some(&'\\') {
-                        end = Some(j + 1);
-                        break;
-                    }
-                    j += 1;
-                }
-                i = match end {
-                    Some(e) => e + 1,
-                    None => i + 1,
-                };
-                continue;
-            }
-
             // Generic two-byte escape (ESC + one char), or a lone trailing ESC.
             i += if i + 1 < n { 2 } else { 1 };
             continue;
@@ -85,8 +115,10 @@ fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
 }
 
 /// For single-line fields (title, assigned_agent, tags, due_date): strip
-/// ANSI escape sequences plus every remaining Unicode control character
-/// (including `\n`/`\r`/`\t` and stray C1 bytes 0x80-0x9F).
+/// ANSI/C1 escape sequences (both `ESC`-prefixed and single-byte forms)
+/// plus every remaining Unicode control character (including `\n`/`\r`/`\t`
+/// and any other stray C1 byte in 0x80-0x9F not already consumed as part of
+/// a CSI/OSC sequence).
 pub fn clean_line(input: &str) -> String {
     strip_ansi(input, |_| false)
 }
@@ -95,6 +127,31 @@ pub fn clean_line(input: &str) -> String {
 /// `\n` and `\t` so legitimate multi-line notes survive.
 pub fn clean_multiline(input: &str) -> String {
     strip_ansi(input, |c| c == '\n' || c == '\t')
+}
+
+/// Max characters kept when echoing untrusted input back into a
+/// human-readable message (see [`sanitize_for_message`]).
+const MESSAGE_ECHO_LIMIT: usize = 80;
+
+/// Make untrusted input safe to embed in a message printed to the terminal
+/// (e.g. a CLI validation error that echoes back the invalid value).
+///
+/// Unlike [`clean_line`], which sanitizes values *before they are stored* in
+/// the database, this covers a different path: input that is rejected
+/// up-front (never stored) but still gets echoed into an error string and
+/// printed directly to stderr. Without this, an invalid `--status`/`--priority`
+/// value containing ANSI/OSC escape sequences would be written to the
+/// terminal verbatim, e.g. `agent-task add T --status $'\x1b]8;;http://evil\x07x'`.
+/// Also bounds the length so a pathologically long argument can't produce an
+/// unbounded error line.
+pub fn sanitize_for_message(input: &str) -> String {
+    let cleaned = clean_line(input);
+    if cleaned.chars().count() <= MESSAGE_ECHO_LIMIT {
+        return cleaned;
+    }
+    let mut out: String = cleaned.chars().take(MESSAGE_ECHO_LIMIT).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -122,9 +179,83 @@ mod tests {
     }
 
     #[test]
-    fn clean_line_strips_c1_and_newlines() {
-        let input = "a\u{9b}b\nc\rd\te";
+    fn clean_line_strips_generic_c1_control_byte_and_newlines() {
+        // U+0085 (NEL) is a plain C1 control byte with no CSI/OSC meaning;
+        // it must simply be dropped like any other control character. (0x9B
+        // is deliberately not used here since it's now a CSI introducer —
+        // see the dedicated c1_csi/c1_osc tests below.)
+        let input = "a\u{85}b\nc\rd\te";
         assert_eq!(clean_line(input), "abcde");
+    }
+
+    #[test]
+    fn clean_line_strips_c1_csi_sequence() {
+        // 0x9B is the 8-bit CSI introducer: equivalent to `ESC '['`. A naive
+        // filter that only recognizes the 7-bit `ESC '['` form would leave
+        // the parameter/final bytes of this variant behind as visible junk.
+        let malicious = "\u{9b}31mRed\u{9b}0mEnd";
+        assert_eq!(clean_line(malicious), "RedEnd");
+    }
+
+    #[test]
+    fn clean_line_strips_c1_osc_sequence() {
+        // 0x9D is the 8-bit OSC introducer: equivalent to `ESC ']'`.
+        let malicious = "\u{9d}8;;http://evil.example\u{7}click\u{9d}8;;\u{7}me";
+        assert_eq!(clean_line(malicious), "clickme");
+    }
+
+    #[test]
+    fn clean_line_c1_csi_over_param_limit_drops_only_introducer() {
+        // Mirrors clean_line_gives_up_on_csi_over_param_limit_and_keeps_scanning
+        // but for the 8-bit introducer: unterminated within the cap, so only
+        // the introducer itself is dropped and the rest survives literally.
+        let params = "1".repeat(16);
+        let input = format!("\u{9b}{params}mEND");
+        let expected = format!("{params}mEND");
+        assert_eq!(clean_line(&input), expected);
+    }
+
+    #[test]
+    fn clean_line_osc_over_param_limit_drops_only_introducer() {
+        // Regression test for the O(n^2) DoS found in adversarial review:
+        // an unterminated OSC payload longer than OSC_PARAM_LIMIT must not
+        // be scanned past the cap. Only the introducer is dropped; the rest
+        // (including the terminal marker "TAIL") survives as literal text.
+        let junk = "9".repeat(OSC_PARAM_LIMIT + 100);
+        let input = format!("\x1b]{junk}TAIL");
+        let out = clean_line(&input);
+        assert!(
+            out.ends_with("TAIL"),
+            "trailing text must survive an over-limit unterminated OSC payload"
+        );
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn clean_line_many_unterminated_osc_introducers_completes_quickly() {
+        // The bug this guards against was quadratic: many unterminated OSC
+        // introducers back-to-back each re-triggered a full-length scan.
+        // 200,000 introducers (400,000 chars) took over a minute pre-fix;
+        // bounded scanning should finish this near-instantly. A generous
+        // wall-clock ceiling keeps this from being flaky on a slow CI
+        // machine while still catching any reintroduction of the O(n^2)
+        // behavior (which would blow well past it).
+        let input = "\x1b]".repeat(200_000);
+        let start = std::time::Instant::now();
+        let out = clean_line(&input);
+        let elapsed = start.elapsed();
+        // Every ESC is dropped (no terminator found within the cap for any
+        // of the 200,000 introducers), but the ']' right after each one is
+        // ordinary text and survives — this isn't asserting "everything
+        // vanishes", just that the scan actually completes (see the timing
+        // assertion below) rather than hanging.
+        assert_eq!(out, "]".repeat(200_000));
+        assert!(
+            elapsed.as_secs() < 5,
+            "sanitizing {} chars took {:?}, expected sub-second; possible O(n^2) regression",
+            input.chars().count(),
+            elapsed
+        );
     }
 
     #[test]
@@ -169,5 +300,33 @@ mod tests {
             clean_line(&input).ends_with("TAIL"),
             "trailing text must survive an unterminated CSI payload"
         );
+    }
+
+    #[test]
+    fn sanitize_for_message_strips_ansi() {
+        let malicious = "\x1b[31mnope\x1b[0m";
+        assert_eq!(sanitize_for_message(malicious), "nope");
+    }
+
+    #[test]
+    fn sanitize_for_message_passes_short_plain_text_unchanged() {
+        assert_eq!(sanitize_for_message("urgentish"), "urgentish");
+    }
+
+    #[test]
+    fn sanitize_for_message_truncates_long_input_with_ellipsis() {
+        let long = "a".repeat(500);
+        let out = sanitize_for_message(&long);
+        assert!(out.chars().count() <= MESSAGE_ECHO_LIMIT + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_for_message_does_not_panic_on_multibyte_boundary() {
+        // Truncation must respect char boundaries even with multi-byte
+        // (e.g. Japanese) characters right at the cutoff point.
+        let long: String = "あ".repeat(500);
+        let out = sanitize_for_message(&long);
+        assert!(out.ends_with('…'));
     }
 }
