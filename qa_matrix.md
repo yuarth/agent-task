@@ -29,6 +29,10 @@
 | コード品質 (敵対的監査 #6 / Issue #7) | `update_task` の冗長な事前存在チェック | 事前の `get_task` 呼び出しを削除しても、存在しない ID への `update`/`complete` が引き続き正しく "not found" として扱われること | ✅ FIXED / PASS | `src/db.rs::update_task` 冒頭の冗長な `get_task` 呼び出しを削除（UPDATE自体は0行影響でも安全に完了し、末尾の `get_task` が最終状態を正しく返すため元々不要だった）。既存の `db::tests::update_missing_task_returns_none` が削除後も PASS することを確認（回帰なし） |
 | 依存関係 | `cargo audit` | 既知の RustSec 脆弱性がロック済み依存関係に含まれないこと | ✅ PASS | `cargo audit`（RustSec advisory-db 1169件）実行、Cargo.lock 上の116クレートに対し指摘0件 |
 | 静的解析 | `cargo clippy --all-targets -- -D warnings` | 警告ゼロで通過すること | ✅ PASS | 敵対的監査で指摘した全6件（Issue #2〜#7）の修正後のコードで再実行し警告0件を確認。`cargo test` は単体49件+結合30件=79件、全PASS |
+| セキュリティ (PR #8 外部敵対的レビュー #1) | `skip_osc` の O(n²) DoS | 終端バイト(BEL/ST)を持たない `ESC ']'`/`0x9D` が連続する巨大な入力(320,000〜100万文字)でも、書き込み系(`add`/`update`)・読み取り専用系(`list --status`)のいずれも準線形時間で応答すること | ✅ FIXED / PASS | 修正前は `skip_csi` にのみ存在した上限 (`CSI_PARAM_LIMIT=16`) が新設の `skip_osc` には無く、未終端OSCの反復でO(n²)（実測: 320,000文字で約11.6秒、`list --status` のような読み取り専用コマンドでも同様に発生）。`OSC_PARAM_LIMIT=512` を導入し `skip_osc` を同じ形で打ち切るよう修正。`sanitize::tests::clean_line_osc_over_param_limit_drops_only_introducer`, `clean_line_many_unterminated_osc_introducers_completes_quickly`(20万個の未終端導入符号が5秒未満で完了することをタイミングアサートで保証) で確認。実バイナリでも再検証: 100万文字のESC OSC/CSI、40万文字のC1 OSC(`0x9D`)いずれも1秒未満で応答 |
+| セキュリティ (PR #8 外部敵対的レビュー #2) | バリデーション(長さ制限)がサニタイズより先に実行されること | `title`/`description`/`assigned`/`tags`/`due` いずれも、生の引数長が上限を超える場合は `sanitize::clean_line`/`clean_multiline` を一切実行せず即座に拒否されること | ✅ FIXED / PASS | 修正前は `sanitize` が先、長さチェックが後の順序で、上記#1のような「最終的には拒否されるべき」巨大ペイロードでも高コストな処理を先に受けてしまい、長さ制限がDoS対策として機能していなかった。`src/main.rs` の `run_add`/`run_update` で全フィールドについて `validate::check_max_len` を生の引数に対して先に実行する順序へ変更。`tests/cli.rs::overlong_field_with_adversarial_content_is_rejected_quickly` — `"\x1b]".repeat(50_000)`(10万文字)の敵対的ペイロードが3秒未満で長さエラーとして拒否されることをタイミングアサートで確認 |
+| セキュリティ (PR #8 外部敵対的レビュー #3) | DB ディレクトリ作成のTOCTOU | 新規DBディレクトリの作成からパーミッション設定(0700)までの間に、緩い権限(umask依存)を持つ瞬間が存在しないこと。12並列プロセスによる同一ディレクトリへの初回同時作成でも、いずれのプロセスも失敗せず最終的に0700で確定すること | ✅ FIXED / PASS | 修正前は `create_dir_all`(既定パーミッションで作成)→事後`chmod`の2段階で、作成からchmodまでの間に緩い権限のウィンドウが存在した(CodeRabbitの自動レビューでも同一箇所を独立に指摘)。`std::os::unix::fs::DirBuilderExt::mode(0o700)` を用いて作成とパーミッション設定をアトミックに行うよう変更。`AlreadyExists` は成功として扱う(複数エージェントプロセスが同じ新規ディレクトリの作成を同時に試みる設計を前提とするため)。`tests/cli.rs::concurrent_fresh_directory_creation_does_not_fail_any_process` — 12並列プロセスでの初回同時作成で全プロセス成功・最終権限0700を確認。実バイナリでも `umask 022` 下での単発作成・12並列作成の双方を再検証し、いずれも0700であることを確認 |
+| 入力検証 (PR #8 外部敵対的レビュー #4) | ゼロ幅文字のみの `title` が空タイトル拒否をすり抜けないこと | U+200B等のゼロ幅文字のみ、または通常の空白とゼロ幅文字を交互に配置した `title` が拒否されること。一方で通常の可視文字を含む `title`(内部に空白を含むものを含む)は誤って拒否されないこと | ✅ FIXED / PASS | 1回目の修正(`width(title.trim()) == 0`)は純粋なゼロ幅文字のみのタイトル(例: U+200B×3)は正しく拒否したが、2回目の敵対的レビューで「`"  \u{200b}  \u{200b}  "` のように通常の空白とゼロ幅文字を交互に配置すると `.trim()` が最初の非空白(ゼロ幅)文字で停止し、内部の通常空白(表示幅を持つ)が未トリムのまま残るため、依然として視覚的に空白セルとして `list` に表示されるタスクが作成できてしまう」というバイパスが新たに発見された。`title.chars().filter(|c| !c.is_whitespace())` で空白文字を先頭・末尾に限らず全体から除去してから表示幅を判定するよう修正し、このバイパスを解消。`validate::tests::zero_width_spaces_interleaved_with_plain_spaces_are_rejected`, `interior_spaces_around_visible_text_are_still_accepted`, `tests/cli.rs::add_rejects_title_with_zero_width_chars_interleaved_with_spaces` で確認。実バイナリでもゼロ幅/不可視文字10種の単体テストに加え、乱数生成した60通りの組み合わせがいずれも正しく拒否され、かつ通常タイトル5種が誤って拒否されないことを確認 |
 
 ## 実行コマンド一覧（再現用）
 
@@ -73,9 +77,23 @@ nix build .#default
 - `title`/`description`/`assigned`/`tags`/`due` は `add`/`update` 時に
   `src/validate.rs` で長さ検証される
   (`title` ≤ 500 文字, `description` ≤ 20,000 文字, その他 ≤ 300 文字)。
+  この長さチェックは常に `sanitize::clean_line`/`clean_multiline` より
+  *先に*、生の引数に対して行う。順序を逆にすると、最終的には長さで
+  拒否されるべき巨大な敵対的ペイロードでもサニタイズ処理そのものを
+  先に受けてしまい、長さ上限がDoS対策として機能しなくなるため。
   `title` は空文字列・空白のみも拒否される。文字数はバイト数ではなく
   Unicode スカラ値単位でカウントするため、日本語などマルチバイト文字を
   不当に不利に扱わない。
+- `title` の非空判定 (`validate::require_non_empty_title`) は、単純な
+  `title.trim().is_empty()` ではなく、文字列中の空白文字（Unicode
+  `White_Space` プロパティ）を先頭・末尾に限らず全て除去したうえで、
+  残った文字列の表示幅 (`unicode-width`) がゼロかどうかで判定する。
+  `.trim()` だけでは「先頭/末尾の空白ラン」しか除去できないため、
+  U+200B 等のゼロ幅文字のみのタイトルや、通常の空白とゼロ幅文字を
+  交互に配置したタイトル（`.trim()` が最初の非空白文字であるゼロ幅
+  文字で止まってしまい、内部の通常空白が未トリムのまま残る）が
+  非空と誤判定され、`list` 上で視覚的に区別できないタスクが作成
+  できてしまう問題を防いでいる。
 - CLI バリデーションエラー（`Status::parse`/`Priority::parse` が拒否した
   不正な `--status`/`--priority` 値）をエラーメッセージに埋め込む際は
   `src/sanitize.rs::sanitize_for_message` を通す。`sanitize::clean_line`
@@ -83,15 +101,26 @@ nix build .#default
   「エラーメッセージへの埋め込み」は別経路のため、専用の関数で対応する
   （ANSI/制御文字除去 + 80 文字を超える場合は省略記号で丸め）。
 - 新規作成する DB ディレクトリ（親ディレクトリが存在しない場合）は Unix
-  では `0700` に制限する (`src/db.rs::harden_dir_permissions`)。既存の
+  では `0700` に制限する (`src/db.rs::create_dir_owner_only`)。既存の
   ディレクトリを利用する場合はパーミッションを変更しない。WAL/SHM
   補助ファイル自体の権限までは制御していないため、ディレクトリの
   実行権限（トラバース禁止）がアクセス制御の主な担保となる点に留意。
+  作成とパーミッション設定は `DirBuilder::mode(0o700)` によりアトミックに
+  行われる（作成後に別途 `chmod` するcreate-then-chmod方式ではない）ため、
+  緩い権限が一瞬でも露出するウィンドウは存在しない。複数のエージェント
+  プロセスが同一の新規ディレクトリを同時に作成しようとするケースは
+  `AlreadyExists` を成功として扱うことで許容している。
 - CSI/OSC の検出は `ESC`版（`ESC '['`/`ESC ']'`）だけでなく、同じ意味を持つ
   8bit C1 制御コード単体（`0x9B` = CSI導入符号, `0x9D` = OSC導入符号）にも
   対応する。`strip_ansi` 内部の走査ロジックは `skip_csi`/`skip_osc` として
-  共通化し、どちらの導入符号からも同じ規則（`CSI_PARAM_LIMIT` を含む）で
-  シーケンス全体を除去する。
+  共通化し、どちらの導入符号からも同じ規則でシーケンス全体を除去する。
+  CSI は `CSI_PARAM_LIMIT = 16` 文字、OSC は `OSC_PARAM_LIMIT = 512` 文字を
+  それぞれ上限としてスキャンを打ち切る（OSC 8 ハイパーリンクのURI等、
+  正当なペイロードはCSIより長くなりうるため上限を分けている）。終端の
+  未終端導入符号が入力中に多数連続していても、各スキャンが上限で
+  打ち切られることで全体の計算量は O(n) に保たれる（上限を設ける前は、
+  未終端の導入符号が繰り返されるたびに毎回残り長さ全体を走査してしまい
+  O(n²) となっていた）。
 - `--due` は `src/validate.rs::validate_due_date` により
   `YYYY-MM-DD`（`chrono::NaiveDate`）または RFC3339
   （`chrono::DateTime::parse_from_rfc3339`）のいずれかの形式のみ許容する。

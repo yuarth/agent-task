@@ -404,6 +404,59 @@ fn add_rejects_overlong_assigned_field() {
         .stderr(predicate::str::contains("長すぎます"));
 }
 
+/// Regression test found in adversarial review: length validation must
+/// reject an oversized value based on its *raw* length before the
+/// (potentially expensive, for adversarial content) sanitize pass ever
+/// runs on it — otherwise the length limit added to guard against exactly
+/// this kind of input doesn't actually prevent it from being processed.
+/// This payload is built from the same pattern that caused an O(n^2) hang
+/// in sanitize::skip_osc pre-fix; if validation ran after sanitizing, this
+/// would take many seconds (or, at larger sizes, much longer). It must
+/// instead be rejected immediately for its length.
+#[test]
+fn overlong_field_with_adversarial_content_is_rejected_quickly() {
+    let (_dir, db) = new_db();
+    let adversarial_payload = "\x1b]".repeat(50_000); // 100,000 chars, well over the 300-char cap
+    let start = std::time::Instant::now();
+    cmd(&db)
+        .args(["add", "T", "--assigned", &adversarial_payload])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("長すぎます"));
+    assert!(
+        start.elapsed().as_secs() < 3,
+        "rejection took {:?}; length validation should short-circuit before sanitizing",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn add_rejects_zero_width_space_only_title() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "\u{200b}\u{200b}\u{200b}"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("空にすることはできません"));
+}
+
+/// Regression test found in a second round of adversarial review: a title
+/// made of zero-width characters interleaved with plain spaces (e.g.
+/// "  \u{200b}  \u{200b}  ") used to bypass the zero-width-title check,
+/// because `.trim()` only strips a leading/trailing *run* of whitespace and
+/// stops at the first non-whitespace (zero-width) character from each edge
+/// -- leaving interior plain spaces, which have nonzero width on their own,
+/// untrimmed. The title still rendered as an entirely blank cell in `list`.
+#[test]
+fn add_rejects_title_with_zero_width_chars_interleaved_with_spaces() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "  \u{200b}  \u{200b}  "])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("空にすることはできません"));
+}
+
 #[test]
 fn update_rejects_setting_title_to_empty() {
     let (_dir, db) = new_db();
@@ -565,5 +618,56 @@ fn pre_existing_db_directory_permissions_are_left_alone() {
     assert_eq!(
         mode, 0o755,
         "pre-existing directory permissions must be untouched"
+    );
+}
+
+/// Regression test found in adversarial review: the directory-hardening fix
+/// creates the directory with its restrictive mode set atomically (via
+/// `DirBuilder::mode`) instead of create-then-chmod, to close a TOCTOU
+/// window. That atomic primitive errors with `AlreadyExists` if the
+/// directory already exists — which several concurrent processes racing to
+/// create the *same brand-new* directory will legitimately trigger for all
+/// but one of them. Since this tool is explicitly designed for multiple
+/// concurrent agent processes sharing one DB, that race must not surface as
+/// a failure to any of them, and the directory must still end up 0700.
+#[cfg(unix)]
+#[test]
+fn concurrent_fresh_directory_creation_does_not_fail_any_process() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    // Not-yet-existing, so every process races to create it.
+    let db = dir.path().join("brand_new_nested_dir").join("tasks.db");
+    let bin = assert_cmd::cargo::cargo_bin("agent-task");
+
+    const WRITERS: usize = 12;
+    let mut children = Vec::with_capacity(WRITERS);
+    for i in 0..WRITERS {
+        let child = StdCommand::new(&bin)
+            .env("AGENT_TASK_DB", &db)
+            .env("NO_COLOR", "1")
+            .args(["add", &format!("同時作成タスク{i}")])
+            .spawn()
+            .expect("プロセス起動に失敗");
+        children.push(child);
+    }
+
+    let mut failures = 0;
+    for mut child in children {
+        let status = child.wait().expect("プロセス待機に失敗");
+        if !status.success() {
+            failures += 1;
+        }
+    }
+    assert_eq!(
+        failures, 0,
+        "concurrent first-time directory creation must not fail any process"
+    );
+
+    let parent = db.parent().unwrap();
+    let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "directory must still end up owner-only regardless of which process created it"
     );
 }
