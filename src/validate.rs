@@ -56,14 +56,34 @@ pub fn check_max_len(value: &str, field_name: &str, max_chars: usize) -> Result<
     Ok(())
 }
 
+/// `chrono`'s `%Y` (used for the plain-date form) and its RFC3339 parser both
+/// accept a variable-width year rather than strictly requiring 4 digits, and
+/// hit internal integer-overflow arithmetic for pathological years (5+
+/// digits). Checked arithmetic makes that surface as a parse failure in a
+/// debug build, but release builds disable overflow checks by default, so
+/// the same input can be silently *accepted* there instead -- observed
+/// directly: `--due 99999-01-01` was rejected under `cargo test` (debug) but
+/// accepted by the `cargo build --release`/Nix-built binary. Both accepted
+/// formats always start with a 4-digit year followed by `-`
+/// (`YYYY-MM-DD...`, per the documented shapes), so rejecting anything else
+/// up front -- before the value ever reaches `chrono` -- removes the
+/// ambiguity entirely and makes acceptance deterministic across build
+/// profiles.
+fn has_four_digit_year(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() > 4 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-'
+}
+
 /// Validate that `value` is a `YYYY-MM-DD` date or an RFC3339 timestamp, as
 /// documented for `--due` in the CLI help/README. Without this, any string
 /// (e.g. a typo, or free-text unrelated to a date) is silently accepted and
 /// stored, only to fail or be silently ignored by future date-aware features
 /// (sorting, overdue detection, ...) that read it back.
 pub fn validate_due_date(value: &str) -> Result<()> {
-    let is_plain_date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
-    let is_rfc3339 = chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    let is_plain_date =
+        has_four_digit_year(value) && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
+    let is_rfc3339 =
+        has_four_digit_year(value) && chrono::DateTime::parse_from_rfc3339(value).is_ok();
     if is_plain_date || is_rfc3339 {
         return Ok(());
     }
@@ -176,6 +196,27 @@ mod tests {
     #[test]
     fn due_date_rejects_invalid_calendar_date() {
         assert!(validate_due_date("2026-13-99").is_err());
+    }
+
+    #[test]
+    fn due_date_accepts_four_digit_year_boundaries() {
+        assert!(validate_due_date("0001-01-01").is_ok());
+        assert!(validate_due_date("9999-12-31").is_ok());
+    }
+
+    /// Regression test for a build-profile-dependent inconsistency found in
+    /// the second round of adversarial audit: without an explicit 4-digit
+    /// year check, `--due 99999-01-01` was rejected under `cargo test`
+    /// (debug, checked arithmetic) but *accepted* by the release/Nix-built
+    /// binary (overflow checks disabled), because chrono's `%Y`/RFC3339
+    /// parsers accept a variable-width year and hit internal overflow for
+    /// pathological years. Both forms must now be rejected deterministically
+    /// regardless of build profile.
+    #[test]
+    fn due_date_rejects_year_with_more_than_four_digits() {
+        assert!(validate_due_date("99999-01-01").is_err());
+        assert!(validate_due_date("99999-01-01T00:00:00Z").is_err());
+        assert!(validate_due_date("00000-01-01").is_err());
     }
 
     #[test]
