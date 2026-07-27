@@ -39,9 +39,63 @@ pub fn resolve_db_path() -> Result<PathBuf> {
         .join("tasks.db"))
 }
 
+/// Number of attempts [`open_db`] makes before giving up on a transient
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` error while opening/initializing the
+/// database. See [`open_db`]'s doc comment for why this exists.
+const OPEN_DB_MAX_ATTEMPTS: u32 = 5;
+
 /// Open (creating if necessary) the SQLite database at `path`, apply the
 /// concurrency pragmas, and ensure the schema exists.
+///
+/// Retries a bounded number of times on a transient `SQLITE_BUSY`/
+/// `SQLITE_LOCKED` error: this tool is explicitly designed for many
+/// concurrent agent processes to race to create the *same brand-new*
+/// database file, and `conn.busy_timeout()` below is only set (and thus
+/// only able to retry internally) *after* `Connection::open` returns --
+/// the handful of milliseconds needed to open the file, apply pragmas, and
+/// run `init_schema` before that point is a real, if narrow, window where
+/// many simultaneous first-time WAL-mode initializations can still surface
+/// `SQLITE_BUSY` to the caller. Confirmed empirically: this can occur (rarely)
+/// even without any of this module's own logic in the way, and stress-testing
+/// showed the exact frequency is sensitive to how much work happens before
+/// the first `Connection::open` call (e.g. this module's own directory
+/// trust checks), so a bounded retry here is more robust than trying to
+/// eliminate the window by shaving individual syscalls off that path.
 pub fn open_db(path: &Path) -> Result<Connection> {
+    let mut last_err = None;
+    for attempt in 0..OPEN_DB_MAX_ATTEMPTS {
+        match try_open_db(path) {
+            Ok(conn) => return Ok(conn),
+            Err(e) if attempt + 1 < OPEN_DB_MAX_ATTEMPTS && is_transient_busy(&e) => {
+                std::thread::sleep(Duration::from_millis(50 * u64::from(attempt + 1)));
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("loop always sets this before exiting via retry exhaustion"))
+}
+
+/// `true` if `err`'s cause chain contains a `rusqlite::Error` carrying
+/// `SQLITE_BUSY` or `SQLITE_LOCKED` -- the specific, transient conditions
+/// [`open_db`]'s retry loop exists to ride out. Any other error (a genuine
+/// I/O failure, a permissions problem, a malformed database, ...) is
+/// propagated immediately without retrying.
+fn is_transient_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
+fn try_open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             ensure_db_dir(parent)?;
@@ -954,5 +1008,50 @@ mod tests {
         let dir = tmp.path().join("fresh");
         ensure_db_dir(&dir).unwrap();
         assert!(dir.is_dir());
+    }
+
+    /// Regression test for outer adversarial review of PR #14: stress-testing
+    /// `concurrent_fresh_directory_creation_does_not_fail_any_process`
+    /// (12 racing OS processes) revealed that this project's directory-trust
+    /// checks -- by adding a little more work before the first
+    /// `Connection::open` call -- made an already-latent, rare `SQLITE_BUSY`
+    /// race (present even before this PR, at roughly 1-in-200 runs, since
+    /// `conn.busy_timeout()` can only start retrying *after* `Connection::open`
+    /// returns) noticeably more frequent (roughly 1-in-30 in local testing).
+    /// `open_db`'s bounded retry loop must recognize a real SQLITE_BUSY/
+    /// SQLITE_LOCKED error so it knows to retry rather than propagate it
+    /// immediately.
+    #[test]
+    fn is_transient_busy_detects_sqlite_busy_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("locktest.db");
+
+        let conn1 = Connection::open(&path).unwrap();
+        conn1.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let conn2 = Connection::open(&path).unwrap();
+        // No retrying on conn2's side -- we want the raw SQLITE_BUSY here,
+        // not for rusqlite to have already waited it out internally.
+        conn2.busy_timeout(Duration::from_millis(0)).unwrap();
+        let err: anyhow::Error = conn2
+            .execute("CREATE TABLE t (id INTEGER)", [])
+            .unwrap_err()
+            .into();
+
+        assert!(
+            is_transient_busy(&err),
+            "expected a transient-busy error, got: {err}"
+        );
+    }
+
+    /// An unrelated error (not a database lock contention) must not be
+    /// retried -- only SQLITE_BUSY/SQLITE_LOCKED should trigger `open_db`'s
+    /// retry loop, so a genuine failure (bad permissions, corrupt file, ...)
+    /// still surfaces immediately instead of being masked by pointless
+    /// retries.
+    #[test]
+    fn is_transient_busy_is_false_for_unrelated_errors() {
+        let err = anyhow::anyhow!("some unrelated error");
+        assert!(!is_transient_busy(&err));
     }
 }
