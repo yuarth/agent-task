@@ -671,3 +671,279 @@ fn concurrent_fresh_directory_creation_does_not_fail_any_process() {
         "directory must still end up owner-only regardless of which process created it"
     );
 }
+
+// --- Adversarial audit round 2 (Issues #9-#12) regression tests ---
+
+/// Regression test for Issue #9: U+202E RIGHT-TO-LEFT OVERRIDE is not a `Cc`
+/// control code, so it survived the ANSI/control-character sanitizer and let
+/// a compliant terminal render a title's characters in reverse visual order
+/// (the same "Trojan Source" class of spoofing as CVE-2021-42574, applied to
+/// task text instead of source code).
+#[test]
+fn bidi_override_characters_are_stripped_from_title() {
+    let (_dir, db) = new_db();
+    let spoofed_title = "safe\u{202e}exe.txt\u{2069}";
+    cmd(&db).args(["add", spoofed_title]).assert().success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored_title = value["title"].as_str().unwrap();
+    assert!(!stored_title.contains('\u{202e}'));
+    assert!(!stored_title.contains('\u{2069}'));
+    assert_eq!(stored_title, "safeexe.txt");
+}
+
+/// Same class of bug via `assigned`/`tags`, which go through `clean_line`
+/// just like `title`.
+#[test]
+fn bidi_override_characters_are_stripped_from_assigned_and_tags() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args([
+            "add",
+            "T",
+            "--assigned",
+            "claude\u{202e}",
+            "--tags",
+            "back\u{2066}end",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd(&db).args(["show", "1", "--json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["assigned_agent"], "claude");
+    assert_eq!(value["tags"], "backend");
+}
+
+/// Regression test for Issue #10: a symlink pre-placed at the path where the
+/// DB directory would be created must not be silently trusted and followed
+/// -- otherwise an attacker who can plant a symlink at a predictable path
+/// (e.g. under a shared /tmp) before the victim's first run can redirect
+/// task storage into a directory they fully control.
+#[cfg(unix)]
+#[test]
+fn db_directory_that_is_a_symlink_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let attacker_dir = dir.path().join("attacker_controlled");
+    std::fs::create_dir(&attacker_dir).unwrap();
+
+    let link = dir.path().join("victim_db_dir");
+    std::os::unix::fs::symlink(&attacker_dir, &link).unwrap();
+
+    let db = link.join("tasks.db");
+    cmd(&db)
+        .args(["add", "T"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("シンボリックリンク"));
+
+    assert!(
+        !attacker_dir.join("tasks.db").exists(),
+        "task data must not be written through a pre-planted symlink"
+    );
+}
+
+/// A freshly-created `tasks.db` file itself must be owner-only (0600), as
+/// defense in depth alongside the containing directory's 0700 mode (Issue
+/// #10's secondary recommendation).
+#[cfg(unix)]
+#[test]
+fn new_db_file_has_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, db) = new_db();
+    cmd(&db).args(["add", "T"]).assert().success();
+
+    let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "expected owner-only file permissions, got {mode:o}"
+    );
+}
+
+/// Regression test for Issue #11: the stored side of a `--tag` filter
+/// compares with spaces stripped (`REPLACE(tags, ' ', '')`), so the search
+/// term must be normalized identically -- otherwise "backend" and "back end"
+/// matched inconsistently depending on which side happened to have the
+/// space. Both queries below must now agree on the same result.
+#[test]
+fn tag_filter_normalizes_internal_spaces_consistently() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "A", "--tags", "back end,other"])
+        .assert()
+        .success();
+    cmd(&db)
+        .args(["add", "B", "--tags", "backend,other"])
+        .assert()
+        .success();
+
+    // Searching without the space finds both (space-insensitive by design).
+    cmd(&db)
+        .args(["list", "--all", "--tag", "backend"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A"))
+        .stdout(predicate::str::contains("B"));
+
+    // Searching *with* the space must no longer come back empty.
+    cmd(&db)
+        .args(["list", "--all", "--tag", "back end"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("A"))
+        .stdout(predicate::str::contains("B"));
+}
+
+/// Regression test for Issue #12: `update <id>` with no field flags at all
+/// used to silently "succeed" (db::update_task always bumps `updated_at`),
+/// masking mistakes like a forgotten flag value in an automated caller.
+#[test]
+fn update_with_no_fields_is_rejected() {
+    let (_dir, db) = new_db();
+    cmd(&db).args(["add", "元のタイトル"]).assert().success();
+
+    cmd(&db)
+        .args(["update", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("更新する項目が指定されていません"));
+}
+
+// --- Remaining Issue #13 test-coverage gaps ---
+
+/// Concurrent `update` and `delete` on the *same* row from different
+/// processes must not crash or hang, regardless of which one "wins" the
+/// race. Unlike `concurrent_multi_process_writes_do_not_crash_or_lose_data`
+/// (independent rows), this exercises contention on a single row.
+#[test]
+fn concurrent_update_and_delete_on_same_row_do_not_crash() {
+    let (_dir, db) = new_db();
+    let bin = assert_cmd::cargo::cargo_bin("agent-task");
+    cmd(&db).args(["add", "RaceTarget"]).assert().success();
+
+    const ROUNDS: usize = 10;
+    let mut children = Vec::with_capacity(ROUNDS * 2);
+    for _ in 0..ROUNDS {
+        children.push(
+            StdCommand::new(&bin)
+                .env("AGENT_TASK_DB", &db)
+                .env("NO_COLOR", "1")
+                .args(["update", "1", "--status", "in_progress"])
+                .spawn()
+                .expect("update プロセス起動に失敗"),
+        );
+        children.push(
+            StdCommand::new(&bin)
+                .env("AGENT_TASK_DB", &db)
+                .env("NO_COLOR", "1")
+                .args(["delete", "1"])
+                .spawn()
+                .expect("delete プロセス起動に失敗"),
+        );
+    }
+
+    for mut child in children {
+        let status = child.wait().expect("プロセス待機に失敗");
+        // Either outcome (found-and-updated, or not-found-because-already-
+        // deleted) is a valid exit status for a genuine race; only a crash
+        // (signal termination) is a bug.
+        assert!(
+            status.code().is_some(),
+            "process must exit normally, not crash/signal: {status:?}"
+        );
+    }
+}
+
+/// Invalid UTF-8 bytes in an argument must be rejected with a clean clap
+/// error, not panic the process.
+#[cfg(unix)]
+#[test]
+fn invalid_utf8_argument_is_rejected_cleanly_without_panicking() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_dir, db) = new_db();
+    let bin = assert_cmd::cargo::cargo_bin("agent-task");
+    let bad_title = std::ffi::OsStr::from_bytes(b"T\xff\xfeX");
+
+    let output = StdCommand::new(&bin)
+        .env("AGENT_TASK_DB", &db)
+        .env("NO_COLOR", "1")
+        .arg("add")
+        .arg(bad_title)
+        .output()
+        .unwrap();
+
+    assert!(output.status.signal().is_none(), "must not crash/signal");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid UTF-8"));
+}
+
+/// `AGENT_TASK_DB` pointing under a path whose parent component is an
+/// ordinary *file* (not a directory) cannot possibly be created as a
+/// directory; this must surface as a clear error, not a panic.
+#[test]
+fn agent_task_db_with_non_directory_parent_component_fails_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let blocking_file = dir.path().join("not_a_directory");
+    std::fs::write(&blocking_file, b"i am a file, not a directory").unwrap();
+
+    let db = blocking_file.join("nested").join("tasks.db");
+    cmd(&db)
+        .args(["add", "T"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ディレクトリ"));
+}
+
+/// Regression test for a build-profile-dependent inconsistency found in the
+/// second round of adversarial audit: `chrono`'s `%Y`/RFC3339 parsers accept
+/// a variable-width year and hit internal integer-overflow arithmetic for
+/// pathological years (5+ digits) -- checked arithmetic surfaced this as a
+/// parse failure under `cargo test` (debug), but the release/Nix-built
+/// binary (overflow checks disabled) silently *accepted* the same
+/// `--due 99999-01-01`. `validate::has_four_digit_year` now rejects
+/// non-4-digit years before they ever reach `chrono`, so acceptance is
+/// deterministic regardless of build profile. Ordinary 4-digit-year
+/// boundaries must still be accepted.
+#[test]
+fn due_date_with_more_than_four_digit_year_is_rejected_deterministically() {
+    let (_dir, db) = new_db();
+    cmd(&db)
+        .args(["add", "A", "--due", "99999-01-01"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("無効な due"));
+    cmd(&db)
+        .args(["add", "B", "--due", "99999-01-01T00:00:00Z"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("無効な due"));
+
+    cmd(&db)
+        .args(["add", "C", "--due", "0001-01-01"])
+        .assert()
+        .success();
+    cmd(&db)
+        .args(["add", "D", "--due", "9999-12-31"])
+        .assert()
+        .success();
+}
+
+/// A title made almost entirely of combining marks (well within the
+/// character-count cap, since each mark is one Unicode scalar value) must
+/// not crash `add`/`list` table rendering, even though such input can render
+/// as visually "stacked" glyphs in a real terminal (a `Zalgo`-text style
+/// nuisance distinct from the ANSI/bidi injection classes already covered).
+#[test]
+fn title_heavy_with_combining_marks_does_not_crash_add_or_list() {
+    let (_dir, db) = new_db();
+    let zalgo_title: String = std::iter::once('e')
+        .chain(std::iter::repeat_n('\u{301}', 400))
+        .collect();
+    cmd(&db).args(["add", &zalgo_title]).assert().success();
+    cmd(&db).args(["list", "--all"]).assert().success();
+}
