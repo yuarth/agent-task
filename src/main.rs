@@ -168,6 +168,27 @@ fn run_update(conn: &Connection, args: UpdateArgs) -> Result<()> {
         validate::validate_due_date(d)?;
     }
 
+    // Without this, `update <id>` with no field flags at all silently
+    // "succeeds" -- db::update_task always includes `updated_at` in its SET
+    // clause, so the UPDATE runs (and the trailing get_task reports the
+    // unchanged row as success) even though nothing the caller could have
+    // intended actually changed. That makes a caller's mistake (e.g. a typo'd
+    // flag name that clap didn't recognize as this command's own flag, or a
+    // script that forgot to pass a value) invisible instead of surfacing as
+    // an error.
+    if title.is_none()
+        && description.is_none()
+        && args.status.is_none()
+        && args.priority.is_none()
+        && assigned.is_none()
+        && tags.is_none()
+        && due.is_none()
+    {
+        return Err(anyhow!(
+            "更新する項目が指定されていません (--title/--status/--priority/--assigned/--tags/--due/--description のいずれかを指定してください)"
+        ));
+    }
+
     let updated = db::update_task(
         conn,
         args.id,

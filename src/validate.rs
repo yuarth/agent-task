@@ -56,14 +56,43 @@ pub fn check_max_len(value: &str, field_name: &str, max_chars: usize) -> Result<
     Ok(())
 }
 
+/// Require the year portion of `value` to be exactly 4 ASCII digits, as
+/// documented for `--due` (`YYYY-MM-DD` / RFC3339, both of which specify a
+/// 4-digit year). `chrono`'s `%Y` (plain-date form) and its RFC3339 parser
+/// both correctly reject a 5+-digit year on their own -- confirmed directly
+/// against this crate's pinned `chrono` version in both debug and release
+/// builds, so there is no cross-build-profile inconsistency to guard
+/// against here. This check exists purely to enforce the documented format
+/// strictly and explicitly, rather than relying on `chrono`'s own
+/// (correct, but not contractually guaranteed by this crate's public API)
+/// rejection behavior for out-of-shape input.
+///
+/// Correction: an earlier version of this comment claimed `chrono` accepted
+/// `--due 99999-01-01` in a release build while rejecting it in a debug
+/// build, attributing this to integer-overflow arithmetic disabled by
+/// release-mode optimizations. That claim was wrong -- it came from
+/// comparing a freshly-built debug binary against a *stale* Nix build
+/// artifact left over from before this project's very first round of
+/// input-validation fixes (which had no `--due` format validation at all),
+/// not a properly rebuilt release binary of matching source. Rebuilding
+/// both profiles cleanly from the same source shows `chrono` rejects
+/// `99999-01-01` identically in both (found during outer adversarial review
+/// of PR #14).
+fn has_four_digit_year(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() > 4 && bytes[..4].iter().all(u8::is_ascii_digit) && bytes[4] == b'-'
+}
+
 /// Validate that `value` is a `YYYY-MM-DD` date or an RFC3339 timestamp, as
 /// documented for `--due` in the CLI help/README. Without this, any string
 /// (e.g. a typo, or free-text unrelated to a date) is silently accepted and
 /// stored, only to fail or be silently ignored by future date-aware features
 /// (sorting, overdue detection, ...) that read it back.
 pub fn validate_due_date(value: &str) -> Result<()> {
-    let is_plain_date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
-    let is_rfc3339 = chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    let is_plain_date =
+        has_four_digit_year(value) && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok();
+    let is_rfc3339 =
+        has_four_digit_year(value) && chrono::DateTime::parse_from_rfc3339(value).is_ok();
     if is_plain_date || is_rfc3339 {
         return Ok(());
     }
@@ -176,6 +205,24 @@ mod tests {
     #[test]
     fn due_date_rejects_invalid_calendar_date() {
         assert!(validate_due_date("2026-13-99").is_err());
+    }
+
+    #[test]
+    fn due_date_accepts_four_digit_year_boundaries() {
+        assert!(validate_due_date("0001-01-01").is_ok());
+        assert!(validate_due_date("9999-12-31").is_ok());
+    }
+
+    /// A year with more than 4 digits must be rejected for both the
+    /// plain-date and RFC3339 forms, matching the documented `YYYY-MM-DD`
+    /// shape strictly (see [`has_four_digit_year`] for why this is checked
+    /// explicitly rather than left to `chrono`'s own -- already correct --
+    /// rejection of such input).
+    #[test]
+    fn due_date_rejects_year_with_more_than_four_digits() {
+        assert!(validate_due_date("99999-01-01").is_err());
+        assert!(validate_due_date("99999-01-01T00:00:00Z").is_err());
+        assert!(validate_due_date("00000-01-01").is_err());
     }
 
     #[test]
