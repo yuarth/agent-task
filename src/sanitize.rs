@@ -12,6 +12,12 @@
 //! - OSC: `ESC ']' ... (BEL | ESC '\\')`, or the single-byte C1 introducer
 //!   `0x9D` in place of `ESC ']'`
 //! - other two-byte escapes: `ESC <any char>`
+//!
+//! It also drops Unicode bidirectional-formatting characters (e.g. U+202E
+//! RIGHT-TO-LEFT OVERRIDE), which are a distinct spoofing vector from ANSI
+//! escapes: they are not `Cc` control codes, so a naive `is_control()` check
+//! does not catch them, yet a compliant terminal will still visually reorder
+//! text around them -- see [`is_bidi_control`].
 
 /// Max characters scanned after a CSI introducer while looking for a CSI
 /// final byte (0x40..=0x7E). Real CSI sequences are always short (a handful
@@ -68,6 +74,24 @@ fn skip_osc(chars: &[char], params_start: usize, n: usize) -> Option<usize> {
     None
 }
 
+/// Unicode bidirectional-formatting characters (General Category `Cf`, the
+/// subset that affects text direction). `char::is_control()` only covers `Cc`
+/// (C0/C1 control codes), so these survive it untouched -- e.g. U+202E
+/// RIGHT-TO-LEFT OVERRIDE can make a terminal render a title's characters in
+/// reverse visual order, the same "Trojan Source" class of spoofing as
+/// CVE-2021-42574, just applied to task text instead of source code. There is
+/// no legitimate use for these in a single-purpose task title/tag/assignee
+/// field, so they are dropped unconditionally (even from `description`, where
+/// `\n`/`\t` are otherwise kept).
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' // LRM, RLM
+        | '\u{202a}'..='\u{202e}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+    )
+}
+
 fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
     let chars: Vec<char> = input.chars().collect();
     let n = chars.len();
@@ -103,7 +127,7 @@ fn strip_ansi<F: Fn(char) -> bool>(input: &str, keep_control: F) -> String {
             continue;
         }
 
-        if c.is_control() && !keep_control(c) {
+        if (c.is_control() && !keep_control(c)) || is_bidi_control(c) {
             i += 1;
             continue;
         }
@@ -256,6 +280,32 @@ mod tests {
             input.chars().count(),
             elapsed
         );
+    }
+
+    #[test]
+    fn clean_line_strips_rtl_override() {
+        // Adversarial-audit round 2: U+202E lets a compliant terminal render
+        // the characters after it in reverse visual order, spoofing what the
+        // displayed title actually says (Trojan-Source-style attack, applied
+        // to task text instead of source code). Not a `Cc` control code, so
+        // it must be handled separately from the generic control filter.
+        let malicious = "safe\u{202e}exe.txt\u{2069}";
+        let out = clean_line(malicious);
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\u{2069}'));
+        assert_eq!(out, "safeexe.txt");
+    }
+
+    #[test]
+    fn clean_line_strips_all_bidi_control_chars() {
+        let malicious = "\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}a\u{2066}\u{2067}\u{2068}\u{2069}";
+        assert_eq!(clean_line(malicious), "a");
+    }
+
+    #[test]
+    fn clean_multiline_strips_bidi_control_even_though_it_keeps_newlines_and_tabs() {
+        let malicious = "line1\u{202e}\nline2";
+        assert_eq!(clean_multiline(malicious), "line1\nline2");
     }
 
     #[test]
