@@ -1,0 +1,13 @@
+pre-push:
+  commands:
+    protect-main-branch:
+      run: |
+        branch=$(git rev-parse --abbrev-ref HEAD)
+        if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+          echo "==========================================================="
+          echo " 🛑 ERROR: Direct push to '$branch' branch is FORBIDDEN!"
+          echo " All changes must be created in a feature branch and merged"
+          echo " via Pull Request after Reviewer adversarial verification."
+          echo "==========================================================="
+          exit 1
+        fi
